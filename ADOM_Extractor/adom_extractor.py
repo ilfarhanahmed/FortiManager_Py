@@ -35,7 +35,7 @@ def bold(t):   return _c("1",  t)
 def dim(t):    return _c("2",  t)
 
 
-# ── ADOM-level root table definitions (228 entries from FM 7.6.6 docs) ────────
+# ── ADOM-level root table definitions (228 entries from FMG 7.6.6 docs) ────────
 #
 # Base URL pattern for every entry:
 #   /pm/config/adom/{adom}/obj/<path>
@@ -580,6 +580,94 @@ ADOM_TABLES = [
 ]
 CATEGORIES = sorted(set(t["name"].split("/")[0] for t in ADOM_TABLES))
 
+# ── ADOM Controller Config table definitions (60 entries from FMG 7.6.6 docs) ──────
+#
+# Base URL pattern:  /pm/config/adom/{adom}/obj/<path>
+# Covers FortiSwitch, FortiAP, FortiExtender, FSP VLAN,
+# and Hotspot 2.0 controller objects.
+#
+CONTROLLER_TABLES = [
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # EXTENSION CONTROLLER (FortiExtender)  —  /pm/config/adom/{adom}/obj/extension-controller/
+    # ──────────────────────────────────────────────────────────────────────────
+    {"name": "extension-controller/extender", "url": "/pm/config/adom/{adom}/obj/extension-controller/extender", "description": "Extender controller configuration."},
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FSP (FortiSwitch Ports — VLANs, packet capture)  —  /pm/config/adom/{adom}/obj/fsp/
+    # ──────────────────────────────────────────────────────────────────────────
+    {"name": "fsp/managed-switch", "url": "/pm/config/adom/{adom}/obj/fsp/managed-switch", "description": "Require device/vdom scope member."},
+    {"name": "fsp/packet-capture", "url": "/pm/config/adom/{adom}/obj/fsp/packet-capture", "description": "Require device/vdom scope member."},
+    {"name": "fsp/vdom-settings/interface-settings", "url": "/pm/config/adom/{adom}/obj/fsp/vdom-settings/interface-settings", "description": "Require device/vdom scope member."},
+    {"name": "fsp/vlan", "url": "/pm/config/adom/{adom}/obj/fsp/vlan", "description": "FortiSwitch VLAN template."},
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SWITCH CONTROLLER (FortiSwitch)  —  /pm/config/adom/{adom}/obj/switch-controller/
+    # ──────────────────────────────────────────────────────────────────────────
+    {"name": "switch-controller/acl/group", "url": "/pm/config/adom/{adom}/obj/switch-controller/acl/group", "description": "Configure ACL groups to be applied on managed FortiSwitch ports."},
+    {"name": "switch-controller/acl/ingress", "url": "/pm/config/adom/{adom}/obj/switch-controller/acl/ingress", "description": "Configure ingress ACL policies to be applied on managed FortiSwitch ports."},
+    {"name": "switch-controller/custom-command", "url": "/pm/config/adom/{adom}/obj/switch-controller/custom-command", "description": "Configure the FortiGate switch controller to send custom commands to managed FortiSwitch devices."},
+    {"name": "switch-controller/dsl/policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/dsl/policy", "description": "DSL policy."},
+    {"name": "switch-controller/dynamic-port-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/dynamic-port-policy", "description": "Configure Dynamic port policy to be applied on the managed FortiSwitch ports through DPP device."},
+    {"name": "switch-controller/fortilink-settings", "url": "/pm/config/adom/{adom}/obj/switch-controller/fortilink-settings", "description": "Configure integrated FortiLink settings for FortiSwitch."},
+    {"name": "switch-controller/lldp-profile", "url": "/pm/config/adom/{adom}/obj/switch-controller/lldp-profile", "description": "Configure FortiSwitch LLDP profiles."},
+    {"name": "switch-controller/mac-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/mac-policy", "description": "Configure MAC policy to be applied on the managed FortiSwitch devices through NAC device."},
+    {"name": "switch-controller/managed-switch", "url": "/pm/config/adom/{adom}/obj/switch-controller/managed-switch", "description": "FortiSwitch Template."},
+    {"name": "switch-controller/ptp/profile", "url": "/pm/config/adom/{adom}/obj/switch-controller/ptp/profile", "description": "Global PTP profile."},
+    {"name": "switch-controller/qos/dot1p-map", "url": "/pm/config/adom/{adom}/obj/switch-controller/qos/dot1p-map", "description": "Configure FortiSwitch QoS 802.1p."},
+    {"name": "switch-controller/qos/ip-dscp-map", "url": "/pm/config/adom/{adom}/obj/switch-controller/qos/ip-dscp-map", "description": "Configure FortiSwitch QoS IP precedence/DSCP."},
+    {"name": "switch-controller/qos/qos-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/qos/qos-policy", "description": "Configure FortiSwitch QoS policy."},
+    {"name": "switch-controller/qos/queue-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/qos/queue-policy", "description": "Configure FortiSwitch QoS egress queue policy."},
+    {"name": "switch-controller/security-policy/802-1X", "url": "/pm/config/adom/{adom}/obj/switch-controller/security-policy/802-1X", "description": "Configure 802.1x MAC Authentication Bypass (MAB) policies."},
+    {"name": "switch-controller/switch-group", "url": "/pm/config/adom/{adom}/obj/switch-controller/switch-group", "description": "Configure FortiSwitch switch groups."},
+    {"name": "switch-controller/switch-interface-tag", "url": "/pm/config/adom/{adom}/obj/switch-controller/switch-interface-tag", "description": "Configure switch object tags."},
+    {"name": "switch-controller/traffic-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/traffic-policy", "description": "Configure FortiSwitch traffic policy."},
+    {"name": "switch-controller/vlan-policy", "url": "/pm/config/adom/{adom}/obj/switch-controller/vlan-policy", "description": "Configure VLAN policy to be applied on the managed FortiSwitch ports through dynamic-port-policy."},
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # WIRELESS CONTROLLER (FortiAP / Wi-Fi)  —  /pm/config/adom/{adom}/obj/wireless-controller/
+    # ──────────────────────────────────────────────────────────────────────────
+    {"name": "wireless-controller/access-control-list", "url": "/pm/config/adom/{adom}/obj/wireless-controller/access-control-list", "description": "Configure WiFi bridge access control list."},
+    {"name": "wireless-controller/apcfg-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/apcfg-profile", "description": "Configure AP local configuration profiles."},
+    {"name": "wireless-controller/arrp-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/arrp-profile", "description": "Configure WiFi Automatic Radio Resource Provisioning (ARRP) profiles."},
+    {"name": "wireless-controller/ble-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/ble-profile", "description": "Configure Bluetooth Low Energy profile."},
+    {"name": "wireless-controller/bonjour-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/bonjour-profile", "description": "Configure Bonjour profiles. Bonjour is Apple's zero configuration networking protocol. Bonjour profiles allow APs and FortiAPs to connect to networks using Bonjour."},
+    {"name": "wireless-controller/hotspot20/anqp-3gpp-cellular", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-3gpp-cellular", "description": "Configure 3GPP public land mobile network (PLMN)."},
+    {"name": "wireless-controller/hotspot20/anqp-ip-address-type", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-ip-address-type", "description": "Configure IP address type availability."},
+    {"name": "wireless-controller/hotspot20/anqp-nai-realm", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-nai-realm", "description": "Configure network access identifier (NAI) realm."},
+    {"name": "wireless-controller/hotspot20/anqp-network-auth-type", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-network-auth-type", "description": "Configure network authentication type."},
+    {"name": "wireless-controller/hotspot20/anqp-roaming-consortium", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-roaming-consortium", "description": "Configure roaming consortium."},
+    {"name": "wireless-controller/hotspot20/anqp-venue-name", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-venue-name", "description": "Configure venue name duple."},
+    {"name": "wireless-controller/hotspot20/anqp-venue-url", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/anqp-venue-url", "description": "Configure venue URL."},
+    {"name": "wireless-controller/hotspot20/h2qp-advice-of-charge", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-advice-of-charge", "description": "Configure advice of charge."},
+    {"name": "wireless-controller/hotspot20/h2qp-conn-capability", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-conn-capability", "description": "Configure connection capability."},
+    {"name": "wireless-controller/hotspot20/h2qp-operator-name", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-operator-name", "description": "Configure operator friendly name."},
+    {"name": "wireless-controller/hotspot20/h2qp-osu-provider", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-osu-provider", "description": "Configure online sign up (OSU) provider list."},
+    {"name": "wireless-controller/hotspot20/h2qp-osu-provider-nai", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-osu-provider-nai", "description": "Configure online sign up (OSU) provider NAI list."},
+    {"name": "wireless-controller/hotspot20/h2qp-terms-and-conditions", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-terms-and-conditions", "description": "Configure terms and conditions."},
+    {"name": "wireless-controller/hotspot20/h2qp-wan-metric", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/h2qp-wan-metric", "description": "Configure WAN metrics."},
+    {"name": "wireless-controller/hotspot20/hs-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/hs-profile", "description": "Configure hotspot profile."},
+    {"name": "wireless-controller/hotspot20/icon", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/icon", "description": "Configure OSU provider icon."},
+    {"name": "wireless-controller/hotspot20/qos-map", "url": "/pm/config/adom/{adom}/obj/wireless-controller/hotspot20/qos-map", "description": "Configure QoS map set."},
+    {"name": "wireless-controller/mpsk-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/mpsk-profile", "description": "Configure MPSK profile."},
+    {"name": "wireless-controller/nac-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/nac-profile", "description": "Configure WiFi network access control (NAC) profiles."},
+    {"name": "wireless-controller/qos-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/qos-profile", "description": "Configure WiFi quality of service (QoS) profiles."},
+    {"name": "wireless-controller/region", "url": "/pm/config/adom/{adom}/obj/wireless-controller/region", "description": "Configure FortiAP regions (for floor plans and maps)."},
+    {"name": "wireless-controller/ssid-policy", "url": "/pm/config/adom/{adom}/obj/wireless-controller/ssid-policy", "description": "Configure WiFi SSID policies."},
+    {"name": "wireless-controller/syslog-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/syslog-profile", "description": "Configure Wireless Termination Points (WTP) system log server profile."},
+    {"name": "wireless-controller/utm-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/utm-profile", "description": "Configure UTM (Unified Threat Management) profile."},
+    {"name": "wireless-controller/vap", "url": "/pm/config/adom/{adom}/obj/wireless-controller/vap", "description": "Configure Virtual Access Points (VAPs)."},
+    {"name": "wireless-controller/vap-group", "url": "/pm/config/adom/{adom}/obj/wireless-controller/vap-group", "description": "Configure virtual Access Point (VAP) groups."},
+    {"name": "wireless-controller/wag-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/wag-profile", "description": "Configure wireless access gateway (WAG) profiles used for tunnels on AP."},
+    {"name": "wireless-controller/wids-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/wids-profile", "description": "Configure wireless intrusion detection system (WIDS) profiles."},
+    {"name": "wireless-controller/wtp", "url": "/pm/config/adom/{adom}/obj/wireless-controller/wtp", "description": "Configure Wireless Termination Points (WTPs), that is, FortiAPs or APs to be managed by FortiGate."},
+    {"name": "wireless-controller/wtp-group", "url": "/pm/config/adom/{adom}/obj/wireless-controller/wtp-group", "description": "Configure WTP groups."},
+    {"name": "wireless-controller/wtp-profile", "url": "/pm/config/adom/{adom}/obj/wireless-controller/wtp-profile", "description": "Configure WTP profiles or FortiAP profiles that define radio settings for manageable FortiAP platforms."},
+]
+
+
+CONTROLLER_CATEGORIES = sorted(set(t['name'].split('/')[0] for t in CONTROLLER_TABLES))
+
 
 # ── FortiManager JSON-RPC client ───────────────────────────────────────────────
 
@@ -830,6 +918,8 @@ def run_extraction(client: FMGClient, adoms: list[str],
             "extracted_at": datetime.now(timezone.utc).isoformat(),
             "adoms": adoms,
             "tables_queried": len(tables),
+                "adom_tables": len([t for t in tables if t in ADOM_TABLES]),
+                "controller_tables": len([t for t in tables if t in CONTROLLER_TABLES]),
         },
         "data": {}
     }
@@ -932,21 +1022,25 @@ def print_banner() -> None:
     print()
     print(bold("  ╔══════════════════════════════════════════════════╗"))
     print(bold("  ║   FortiManager ADOM Object Extractor v1.0        ║"))
-    print(bold("  ║   FMG 7.6.6 · 228 object types · JSON-RPC API    ║"))
+    print(bold("  ║   FMG 7.6.6 · 288 object types · JSON-RPC API    ║"))
     print(bold("  ╚══════════════════════════════════════════════════╝"))
     print()
 
 
+ALL_TABLES = ADOM_TABLES + CONTROLLER_TABLES
+ALL_CATEGORIES = sorted(set(t["name"].split("/")[0] for t in ALL_TABLES))
+
+
 def select_tables(category_filter: str | None) -> list[dict]:
     if category_filter:
-        selected = [t for t in ADOM_TABLES
+        selected = [t for t in ALL_TABLES
                     if t["name"].split("/")[0] == category_filter]
         if not selected:
             print(red(f"  Unknown category '{category_filter}'."))
-            print(f"  Available: {', '.join(CATEGORIES)}")
+            print(f"  Available: {', '.join(ALL_CATEGORIES)}")
             sys.exit(1)
         return selected
-    return ADOM_TABLES
+    return ALL_TABLES
 
 
 def display_name(adom: str) -> str:
@@ -1074,7 +1168,7 @@ Examples:
     p.add_argument("--user",     help="API username")
     p.add_argument("--password", help="Password (omit to prompt securely)")
     p.add_argument("--adom",     help="Extract only this ADOM (default: all)")
-    p.add_argument("--category", help="Extract only this category (e.g. firewall)")
+    p.add_argument("--category", help="Extract only this category (e.g. firewall, wireless-controller). Covers both ADOM and Controller tables.")
     p.add_argument("--out",      default="", help="Output JSON filename (default: auto-generated)")
     p.add_argument("--no-csv",   action="store_true", help="Skip CSV export")
     p.add_argument("--no-summary", action="store_true", help="Skip count summary")
@@ -1111,11 +1205,15 @@ def main() -> None:
     args = parse_args()
 
     if args.list_categories:
-        print("\nAvailable categories:\n")
+        print("\nADOM Object categories:\n")
         for cat in CATEGORIES:
             count = sum(1 for t in ADOM_TABLES if t["name"].split("/")[0] == cat)
-            print(f"  {cat:<30} {count} table(s)")
-        print()
+            print(f"  {cat:<40} {count} table(s)")
+        print("\nADOM Controller Config categories:\n")
+        for cat in CONTROLLER_CATEGORIES:
+            count = sum(1 for t in CONTROLLER_TABLES if t["name"].split("/")[0] == cat)
+            print(f"  {cat:<40} {count} table(s)")
+        print(f"\n  Total: {len(ALL_TABLES)} tables across {len(ALL_CATEGORIES)} categories\n")
         return
 
     print_banner()
@@ -1135,8 +1233,13 @@ def main() -> None:
     # ── table / category selection ─────────────────────────────────────────────
     tables = select_tables(args.category)
     if args.category:
-        print(f"  Category filter: {cyan(args.category)} "
-              f"({len(tables)} table(s))")
+        print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
+    else:
+        adom_cnt = len(ADOM_TABLES)
+        ctrl_cnt = len(CONTROLLER_TABLES)
+        print(f"  Extracting {bold(str(adom_cnt))} ADOM object tables "
+              f"+ {bold(str(ctrl_cnt))} Controller Config tables "
+              f"= {bold(str(adom_cnt + ctrl_cnt))} total")
 
     # ── connect ────────────────────────────────────────────────────────────────
     print(f"\n  Connecting to {cyan(f'https://{host}:{port}')} ...", end="", flush=True)
