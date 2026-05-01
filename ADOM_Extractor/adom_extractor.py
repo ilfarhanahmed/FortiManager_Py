@@ -1426,11 +1426,19 @@ def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
 # ── Restore (push) helpers ────────────────────────────────────────────────────
 # Inlined from fmg_adom_pusher.py so both modes share the live FMG session.
 
-_PUSH_STRIP = {"oid", "obj-ver", "dirty", "_image-base64"}
+# Fields stripped from both the top-level object and each dynamic_mapping entry.
+_PUSH_STRIP = {"oid", "obj-ver", "uuid", "_image-base64"}
 
 
 def _push_clean(obj: dict) -> dict:
-    return {k: v for k, v in obj.items() if k not in _PUSH_STRIP}
+    """Strip server-generated fields from object and its dynamic_mapping entries."""
+    cleaned = {k: v for k, v in obj.items() if k not in _PUSH_STRIP}
+    if "dynamic_mapping" in cleaned and isinstance(cleaned["dynamic_mapping"], list):
+        cleaned["dynamic_mapping"] = [
+            {k: v for k, v in dm.items() if k not in _PUSH_STRIP}
+            for dm in cleaned["dynamic_mapping"]
+        ]
+    return cleaned
 
 
 # Maximum objects per set call.
@@ -1464,11 +1472,11 @@ def _push_table(client: FMGClient, table_name: str, entries: list,
 
     pushed = errors = 0
 
-    # Send in chunks of _PUSH_CHUNK_SIZE
+    # Send in chunks using set (creates if missing, overwrites if exists)
     for i in range(0, len(batch), _PUSH_CHUNK_SIZE):
         chunk = batch[i:i + _PUSH_CHUNK_SIZE]
 
-        resp = client._call("set", [{"url": url, "data": chunk}])
+        resp   = client._call("set", [{"url": url, "data": chunk}])
         result = resp.get("result", [{}])[0]
         code   = result.get("status", {}).get("code", -1)
 
@@ -1477,9 +1485,9 @@ def _push_table(client: FMGClient, table_name: str, entries: list,
         else:
             # Chunk failed — retry one-by-one to salvage what we can
             for obj in chunk:
-                r      = client._call("set", [{"url": url, "data": [obj]}])
-                res    = r.get("result", [{}])[0]
-                code   = res.get("status", {}).get("code", -1)
+                r    = client._call("set", [{"url": url, "data": [obj]}])
+                res  = r.get("result", [{}])[0]
+                code = res.get("status", {}).get("code", -1)
                 if code == 0:
                     pushed += 1
                 else:
@@ -1591,11 +1599,15 @@ def _pick_target_adom(client: FMGClient, source_version: str = "",
         print(f"  {cyan(str(i).ljust(col_idx))}{sep}{lbl:<{col_name}}{sep}{dim(note) if note else ''}")
     print()
 
+    print(f"  Type {dim('back')} to go back.")
+    print()
     while True:
         raw = input("  Selection > ").strip()
         if not raw:
             print(red("  Please enter a number or ADOM name."))
             continue
+        if raw.lower() in ("back", "b", "q"):
+            return None
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(all_adoms):
@@ -1681,36 +1693,43 @@ def _print_obj_config(entry: dict) -> None:
             if not v:
                 return dim("[]")
             if all(isinstance(i, (str, int, float, bool)) for i in v):
-                # Flat list — one line
                 return dim(", ".join(str(i) for i in v))
-            # Complex list — each item on its own line
+            # Complex list — each item indented as a block
             lines = []
             for item in v:
                 if isinstance(item, dict):
-                    lines.append(_fmt_val(item, indent))
+                    item_lines = _fmt_dict(item, indent)
+                    lines.append(item_lines)
                 else:
                     lines.append(pad + dim(str(item)))
             return "\n" + "\n".join(lines)
         elif isinstance(v, dict):
             if not v:
                 return dim("{}")
-            lines = []
-            col = max((len(k) for k in v), default=0)
-            for k, dv in v.items():
-                if dv is None or dv == [] or dv == "":
-                    continue
-                lines.append(f"{pad}{cyan(k.ljust(col))}  {_fmt_val(dv, indent + 4)}")
-            return "\n" + "\n".join(lines) if lines else dim("{}")
+            return "\n" + _fmt_dict(v, indent)
         elif v is None:
             return dim("null")
         else:
             return str(v)
 
-    col = max((len(k) for k in entry if k not in _SKIP), default=10)
-    for k, v in entry.items():
-        if k in _SKIP or v is None or v == [] or v == "":
-            continue
-        formatted = _fmt_val(v)
+    def _fmt_dict(d: dict, indent: int) -> str:
+        """Format a dict as indented key-value lines, skipping read-only fields."""
+        pad  = " " * indent
+        keys = [k for k in d if k not in _SKIP and d[k] not in (None, [], "")]
+        if not keys:
+            return ""
+        col  = max(len(k) for k in keys)
+        lines = []
+        for k in keys:
+            v = d[k]
+            lines.append(f"{pad}{cyan(k.ljust(col))}  {_fmt_val(v, indent + 4)}")
+        return "\n".join(lines)
+
+    # Top-level: skip read-only and empty, align by longest key
+    keys = [k for k in entry if k not in _SKIP and entry[k] not in (None, [], "")]
+    col  = max((len(k) for k in keys), default=10)
+    for k in keys:
+        formatted = _fmt_val(entry[k])
         print(f"    {cyan(k.ljust(col))}  {formatted}")
 
 
@@ -1967,6 +1986,8 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
     # ── pick target ADOM on the live FMG ─────────────────────────────────────
     source_version = payload.get("metadata", {}).get("fmg_version", "")
     target_adom    = _pick_target_adom(client, source_version, adom_enabled)
+    if target_adom is None:
+        return  # user went back
     _ensure_adom(client, target_adom)
 
     # ── Steps 1 & 2 in a loop so "back" goes up one level ───────────────────
