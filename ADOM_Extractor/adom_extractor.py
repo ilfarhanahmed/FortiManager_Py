@@ -748,8 +748,10 @@ class FMGClient:
         FORTIOS_PRDS = {"fos", "foc", "ffw", "fwc", "fpx"}
 
         resp = self._call("get", [{
-            "url": "/dvmdb/adom",
-            "fields": ["name", "restricted_prds"],
+            "url":     "/dvmdb/adom",
+            "option":  "name",
+            "fields":  ["name", "restricted_prds"],
+            "verbose": 1,
         }])
         result = resp.get("result", [{}])
         status = result[0].get("status", {})
@@ -766,14 +768,21 @@ class FMGClient:
             if name == "rootp":
                 filtered.append(name)
                 continue
-            # restricted_prds may be a list of strings or a bitmask int
-            # depending on FMG version — handle both
+            # restricted_prds may be returned as:
+            #   list  e.g. ["fos", "fpx"]   — newer FMG versions
+            #   str   e.g. "fos"            — single-product ADOMs on some versions
+            #   int   e.g. 0x0001           — bitmask on older FMG versions
+            #   []  / missing               — "all products" ADOM
             prds = a.get("restricted_prds", [])
             if isinstance(prds, int):
                 # bitmask: fos=0x0001, ffw=0x0008, fwc=0x0010, foc=0x0020, fpx=0x0200
                 BITMASK = {0x0001: "fos", 0x0008: "ffw", 0x0010: "fwc",
                            0x0020: "foc", 0x0200: "fpx"}
                 prds = [v for k, v in BITMASK.items() if prds & k]
+            elif isinstance(prds, str):
+                # single product returned as a bare string — wrap in a list
+                prds = [prds] if prds else []
+            # prds is now always a list
             if not prds or set(prds) & FORTIOS_PRDS:
                 # empty restricted_prds means "all products" — include it
                 filtered.append(name)
@@ -1025,6 +1034,7 @@ def print_banner() -> None:
     print(bold("  ║   FMG 7.6.6 · 288 object types · JSON-RPC API    ║"))
     print(bold("  ╚══════════════════════════════════════════════════╝"))
     print()
+    print()
 
 
 ALL_TABLES = ADOM_TABLES + CONTROLLER_TABLES
@@ -1105,29 +1115,35 @@ def select_adoms(client: FMGClient, adom_filter: str | None,
     print()
     print(f"  Enter numbers or names  (e.g. {dim('1,3')} or {dim('root,FortiFirewall')})")
     print(f"  Press {dim('Enter')} or type {dim('all')} to select all.")
+    print(f"  Type {dim('back')} to return to the main menu.")
     print()
 
     while True:
         raw = input("  Selection > ").strip()
 
+        if raw.lower() in ("back", "b", "q"):
+            return None  # caller should treat None as "go back"
+
         if raw == "" or raw.lower() == "all":
             print(f"  Selected: {cyan('all ' + str(len(all_adoms)) + ' ADOM(s)')}")
             return all_adoms
 
-        # Parse tokens: numbers, display names, or real names
+        # Parse tokens: real ADOM name checked first (handles numeric ADOM names
+        # like "72" or "74" that would otherwise be misread as index numbers),
+        # then friendly aliases, then fall back to treating as a row index.
         selected = []
         invalid = []
         for token in (t.strip() for t in raw.split(",") if t.strip()):
-            if token.isdigit():
+            if token in all_adoms:                                # exact name match (first!)
+                selected.append(token)
+            elif token.lower() == "global" and "rootp" in all_adoms:  # friendly alias
+                selected.append("rootp")
+            elif token.isdigit():                                 # row index fallback
                 idx = int(token) - 1
                 if 0 <= idx < len(all_adoms):
                     selected.append(all_adoms[idx])
                 else:
                     invalid.append(token)
-            elif token in all_adoms:                              # real name match
-                selected.append(token)
-            elif token.lower() == "global" and "rootp" in all_adoms:  # friendly alias
-                selected.append("rootp")
             else:
                 invalid.append(token)
 
@@ -1143,6 +1159,196 @@ def select_adoms(client: FMGClient, adom_filter: str | None,
         selected = [x for x in selected if not (x in seen or seen.add(x))]
         print(f"  Selected: {cyan(', '.join(display_name(a) for a in selected))}")
         return selected
+
+
+def _print_divider(label: str = "") -> None:
+    if label:
+        pad = "─" * 2
+        print(f"  {dim(pad + ' ' + label + ' ' + '─' * max(0, 52 - len(label)))}")
+    else:
+        print("  " + dim("─" * 56))
+
+
+def _show_category_list() -> None:
+    """Print the two-section category list (ADOM Objects / Controller Config)."""
+    adom_cats = sorted(set(t["name"].split("/")[0] for t in ADOM_TABLES))
+    ctrl_cats = sorted(set(t["name"].split("/")[0] for t in CONTROLLER_TABLES))
+    all_cats  = adom_cats + ctrl_cats
+
+    col_idx  = len(str(len(all_cats)))
+    col_name = max(len(c) for c in all_cats)
+    sep      = "  "
+
+    _print_divider("ADOM Objects")
+    for i, cat in enumerate(adom_cats, 1):
+        count = sum(1 for t in ADOM_TABLES if t["name"].split("/")[0] == cat)
+        print(f"  {cyan(str(i).ljust(col_idx))}{sep}{cat.ljust(col_name)}{sep}"
+              f"{dim(str(count) + (' table' if count == 1 else ' tables'))}")
+
+    print()
+    _print_divider("Controller Config")
+    for i, cat in enumerate(ctrl_cats, len(adom_cats) + 1):
+        count = sum(1 for t in CONTROLLER_TABLES if t["name"].split("/")[0] == cat)
+        print(f"  {cyan(str(i).ljust(col_idx))}{sep}{cat.ljust(col_name)}{sep}"
+              f"{dim(str(count) + (' table' if count == 1 else ' tables'))}")
+
+    return adom_cats + ctrl_cats
+
+
+def _show_table_list(cat: str) -> list[dict]:
+    """Print all tables in a category and return them."""
+    tables = [t for t in ALL_TABLES if t["name"].split("/")[0] == cat]
+    col_idx = len(str(len(tables)))
+    col_name = max(len(t["name"]) for t in tables)
+    print()
+    _print_divider(f"{cat}  ({len(tables)} tables)")
+    for i, t in enumerate(tables, 1):
+        desc = dim("  " + t["description"][:55]) if t["description"] else ""
+        print(f"  {cyan(str(i).ljust(col_idx))}  {t['name'].ljust(col_name)}{desc}")
+    print()
+    return tables
+
+
+def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] | None:
+    """
+    Multi-step interactive table picker:
+      Step 1 — All objects  OR  Selective
+      Step 2 — Category list  (if selective)
+      Step 3 — All tables in category  OR  pick specific table(s) / range
+    At every step typing 'back' goes up one level; 'back' at step 1 returns None.
+    """
+    adom_cats = sorted(set(t["name"].split("/")[0] for t in ADOM_TABLES))
+    ctrl_cats = sorted(set(t["name"].split("/")[0] for t in CONTROLLER_TABLES))
+    all_cats  = adom_cats + ctrl_cats
+
+    # ── Step 1: All or Selective ───────────────────────────────────────────────
+    while True:
+        print()
+        print(bold("  Export scope"))
+        print()
+        print(f"  {cyan('1')}  All objects      {dim(str(len(ALL_TABLES)) + ' tables across ' + str(len(all_cats)) + ' categories')}")
+        print(f"  {cyan('2')}  Selective export {dim('choose category then tables')}")
+        print()
+        print(f"  Type {dim('back')} to return to the main menu.")
+        print()
+        raw = input("  Selection > ").strip().lower()
+
+        if raw in ("back", "b", "q"):
+            return None
+
+        if raw in ("1", "all"):
+            print(f"  Scope: {cyan('all')}  ({len(ALL_TABLES)} tables)")
+            return ALL_TABLES
+
+        if raw in ("2", "selective", "s"):
+            break   # proceed to category picker
+
+        print(red("  Please enter 1 or 2."))
+
+    # ── Step 2: Category picker ────────────────────────────────────────────────
+    while True:
+        print()
+        print(bold("  Select category"))
+        print()
+        all_cats = _show_category_list()  # returns the full list
+        print()
+        print(f"  Enter a {dim('number')} to pick a category.")
+        print(f"  Type {dim('back')} to go back.")
+        print()
+
+        raw = input("  Selection > ").strip()
+
+        if raw.lower() in ("back", "b", "q"):
+            break   # back to step 1
+
+        # Resolve to a category
+        cat = None
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(all_cats):
+                cat = all_cats[idx]
+            else:
+                print(red(f"  Number out of range (1–{len(all_cats)})."))
+                continue
+        elif raw in all_cats:
+            cat = raw
+        else:
+            print(red(f"  Unknown category '{raw}' — try again."))
+            continue
+
+        # ── Step 3: Table picker within category ──────────────────────────────
+        while True:
+            cat_tables = _show_table_list(cat)
+            n = len(cat_tables)
+
+            print(f"  {cyan('0')}  All {n} tables in {bold(cat)}")
+            print()
+            print(f"  Enter {dim('0')} for all, a {dim('number')}, or a {dim('range')} like {dim('1-5')}.")
+            print(f"  You can also combine: {dim('1,3,5-8')}")
+            print(f"  Type {dim('back')} to go back to categories.")
+            print()
+
+            raw2 = input("  Selection > ").strip()
+
+            if raw2.lower() in ("back", "b", "q"):
+                break   # back to category picker
+
+            if raw2 == "0" or raw2.lower() == "all" or raw2 == "":
+                print(f"  Scope: {cyan(cat)}  (all {n} tables)")
+                return cat_tables
+
+            # Parse numbers and ranges e.g. "1,3,5-8"
+            selected: list[dict] = []
+            invalid:  list[str]  = []
+            seen_idx: set        = set()
+
+            for token in (t.strip() for t in raw2.split(",") if t.strip()):
+                # Range e.g. "2-5"
+                if "-" in token:
+                    parts = token.split("-", 1)
+                    if parts[0].isdigit() and parts[1].isdigit():
+                        lo, hi = int(parts[0]) - 1, int(parts[1]) - 1
+                        if 0 <= lo <= hi < n:
+                            for idx in range(lo, hi + 1):
+                                if idx not in seen_idx:
+                                    seen_idx.add(idx)
+                                    selected.append(cat_tables[idx])
+                        else:
+                            invalid.append(token)
+                    else:
+                        invalid.append(token)
+                elif token.isdigit():
+                    idx = int(token) - 1
+                    if 0 <= idx < n:
+                        if idx not in seen_idx:
+                            seen_idx.add(idx)
+                            selected.append(cat_tables[idx])
+                    else:
+                        invalid.append(token)
+                else:
+                    # Try exact table name
+                    match = [t for t in cat_tables if t["name"] == token]
+                    if match:
+                        for t in match:
+                            if id(t) not in seen_idx:
+                                seen_idx.add(id(t))
+                                selected.append(t)
+                    else:
+                        invalid.append(token)
+
+            if invalid:
+                print(red(f"  Unknown: {', '.join(invalid)} — try again."))
+                continue
+            if not selected:
+                print(red("  Nothing selected — try again."))
+                continue
+
+            names = ", ".join(t["name"] for t in selected)
+            print(f"  Scope: {cyan(names)}  ({len(selected)} table(s))")
+            return selected
+
+    # User went back from category step — loop back to step 1
+    return select_tables_interactive()
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -1178,12 +1384,12 @@ Examples:
     return p.parse_args()
 
 
-def run_once(client: FMGClient, tables: list[dict], args: argparse.Namespace,
-             adom_enabled: bool) -> None:
-    """Perform one full ADOM selection → extract → save cycle."""
-
-    # ── ADOM selection ────────────────────────────────────────────────────────
-    adoms = select_adoms(client, args.adom, adom_enabled)
+def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
+             args: argparse.Namespace) -> bool:
+    """
+    Extract the given adoms/tables and save output.
+    Returns True on completion, False on error.
+    """
 
     # ── extract ───────────────────────────────────────────────────────────────
     result = run_extraction(client, adoms, tables)
@@ -1199,6 +1405,366 @@ def run_once(client: FMGClient, tables: list[dict], args: argparse.Namespace,
         write_summary(result)
 
     print(green("  Done.\n"))
+    return True
+
+
+# ── Restore (push) helpers ────────────────────────────────────────────────────
+# Inlined from fmg_adom_pusher.py so both modes share the live FMG session.
+
+_PUSH_STRIP = {"oid", "obj-ver", "dirty", "_image-base64"}
+
+
+def _push_clean(obj: dict) -> dict:
+    return {k: v for k, v in obj.items() if k not in _PUSH_STRIP}
+
+
+# Maximum objects per set call. FMG can reject very large payloads;
+# 100 is a safe chunk size that balances speed vs. reliability.
+_PUSH_CHUNK_SIZE = 100
+
+
+def _push_table(client: FMGClient, table_name: str, entries: list,
+                target_adom: str, dry_run: bool,
+                progress_cb=None) -> tuple[int, int]:
+    """
+    Push all entries for one table using chunked set calls.
+    Sends up to _PUSH_CHUNK_SIZE objects per request.
+    If a chunk fails, falls back to one-by-one for that chunk only.
+    progress_cb(pushed, errors, total) is called after each chunk.
+    """
+    if not entries:
+        return 0, 0
+
+    url   = build_url({"url": f"/pm/config/adom/{{adom}}/obj/{table_name}"}, target_adom)
+    batch = [_push_clean(e) for e in entries]
+
+    if dry_run:
+        if progress_cb:
+            progress_cb(len(batch), 0, len(batch))
+        return len(batch), 0
+
+    pushed = errors = 0
+
+    # Send in chunks of _PUSH_CHUNK_SIZE
+    for i in range(0, len(batch), _PUSH_CHUNK_SIZE):
+        chunk = batch[i:i + _PUSH_CHUNK_SIZE]
+
+        resp = client._call("set", [{"url": url, "data": chunk}])
+        code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+
+        if code == 0:
+            pushed += len(chunk)
+        else:
+            # Chunk failed — retry one-by-one to salvage what we can
+            for obj in chunk:
+                r    = client._call("set", [{"url": url, "data": [obj]}])
+                code = r.get("result", [{}])[0].get("status", {}).get("code", -1)
+                if code == 0:
+                    pushed += 1
+                else:
+                    errors += 1
+
+        if progress_cb:
+            progress_cb(pushed, errors, len(batch))
+
+    return pushed, errors
+
+
+def _pick_restore_file() -> str:
+    """List available extractor JSON files and let the user pick one."""
+    candidates = sorted(
+        f for f in os.listdir(".")
+        if f.startswith("fmg_adom_objects") and f.endswith(".json")
+    )
+    if candidates:
+        print()
+        print(f"  Available extractor files in current directory:\n")
+        for i, f in enumerate(candidates, 1):
+            size_kb = os.path.getsize(f) / 1024
+            print(f"    {cyan(str(i))}  {f}  {dim(f'({size_kb:.0f} KB)')}")
+        print()
+        raw = input("  Select file (number or full path): ").strip()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(candidates):
+                return candidates[idx]
+        return raw
+    return input("  Path to extractor JSON file: ").strip()
+
+
+def _pick_source_adom_from_file(file_data: dict) -> str:
+    """Pick which ADOM from the loaded JSON to use as source."""
+    adoms = list(file_data.keys())
+    if not adoms:
+        print(red("  No ADOM data found in the JSON file."))
+        sys.exit(1)
+    if len(adoms) == 1:
+        adom = adoms[0]
+        print(f"  Source ADOM : {cyan(display_name(adom))} (only one in file)")
+        return adom
+    print(f"\n  ADOMs in file:")
+    for i, a in enumerate(adoms, 1):
+        print(f"    {cyan(str(i))}  {display_name(a)}")
+    print()
+    while True:
+        raw = input("  Select source ADOM > ").strip()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(adoms):
+                return adoms[idx]
+        if raw in adoms:
+            return raw
+        if raw.lower() == "global" and "rootp" in adoms:
+            return "rootp"
+        print(red("  Invalid selection — try again."))
+
+
+def _pick_target_adom(client: FMGClient) -> str:
+    """Numbered ADOM picker for restore target; allows typing a new ADOM name."""
+    all_adoms = client.get_adoms()
+    if "root" not in all_adoms:
+        all_adoms = ["root"] + all_adoms
+
+    labels = [display_name(a) for a in all_adoms]
+    notes  = ["Global Policy" if a == "rootp" else "" for a in all_adoms]
+
+    col_idx  = max(len(str(len(all_adoms))), 1)
+    col_name = max(len("ADOM Name"), max(len(l) for l in labels))
+    col_note = max(len("Note"), max((len(n) for n in notes if n), default=0))
+    sep      = "  "
+    divider  = "─" * (col_idx + len(sep) + col_name + len(sep) + col_note)
+
+    print()
+    print(f"  Select target ADOM  {dim('(or type a new name to create it)')}")
+    print(f"  {'#':<{col_idx}}{sep}{'ADOM Name':<{col_name}}{sep}Note")
+    print("  " + divider)
+    for i, (name, lbl, note) in enumerate(zip(all_adoms, labels, notes), 1):
+        print(f"  {cyan(str(i).ljust(col_idx))}{sep}{lbl:<{col_name}}{sep}{dim(note) if note else ''}")
+    print()
+
+    while True:
+        raw = input("  Selection > ").strip()
+        if not raw:
+            print(red("  Please enter a number or ADOM name."))
+            continue
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(all_adoms):
+                chosen = all_adoms[idx]
+                print(f"  Selected: {cyan(display_name(chosen))}")
+                return chosen
+            print(red(f"  Number out of range (1–{len(all_adoms)})."))
+            continue
+        if raw.lower() == "global" and "rootp" in all_adoms:
+            print(f"  Selected: {cyan('Global')}")
+            return "rootp"
+        if raw in all_adoms:
+            print(f"  Selected: {cyan(display_name(raw))}")
+            return raw
+        # New ADOM
+        print(f"  ADOM {cyan(raw)} not found.")
+        confirm = input(f"  Create new ADOM '{raw}'? [y/N]: ").strip().lower()
+        if confirm in ("y", "yes"):
+            return raw
+
+
+def _ensure_adom(client: FMGClient, adom: str) -> None:
+    """Create the ADOM if it does not already exist."""
+    resp = client._call("get", [{"url": f"/dvmdb/adom/{adom}"}])
+    code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+    if code == 0:
+        return  # already exists
+    print(f"  Creating ADOM {cyan(adom)} ...", end=" ", flush=True)
+    resp = client._call("add", [{
+        "url":  "/dvmdb/adom",
+        "data": {
+            "name":            adom,
+            "restricted_prds": ["fos"],
+            "desc":            f"Created by fmg_adom_extractor on "
+                               f"{datetime.now(timezone.utc).isoformat()}",
+        },
+    }])
+    code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+    if code == 0:
+        print(green("OK"))
+    else:
+        print(red(f"failed (code {code})"))
+        sys.exit(1)
+
+
+def _write_push_report(results: dict, source_adom: str,
+                       target_adom: str, dry_run: bool) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname     = f"fmg_push_report_{timestamp}.json"
+    report    = {
+        "metadata": {
+            "pushed_at":   datetime.now(timezone.utc).isoformat(),
+            "source_adom": source_adom,
+            "target_adom": target_adom,
+            "dry_run":     dry_run,
+        },
+        "results": results,
+        "summary": {
+            "tables":         len(results),
+            "total_objects":  sum(v["total"]  for v in results.values()),
+            "pushed":         sum(v["pushed"] for v in results.values()),
+            "errors":         sum(v["errors"] for v in results.values()),
+        },
+    }
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, default=str)
+    size_kb = os.path.getsize(fname) / 1024
+    print(f"  {green('✓')} Report → {bold(fname)}  ({size_kb:.0f} KB)")
+
+
+def mode_restore(client: FMGClient, dry_run: bool = False) -> None:
+    """Interactive restore-from-file flow using the live client session."""
+
+    # ── pick file ─────────────────────────────────────────────────────────────
+    json_file = _pick_restore_file()
+    if not os.path.isfile(json_file):
+        print(red(f"  File not found: {json_file}"))
+        return
+
+    print(f"\n  Loading {cyan(json_file)} ...", end=" ", flush=True)
+    try:
+        with open(json_file, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(red(f"\n  ✗ {exc}"))
+        return
+
+    file_data = payload.get("data", {})
+    if not file_data:
+        print(red("\n  ✗ JSON file has no 'data' key or is empty."))
+        return
+
+    total_objs = sum(len(v) for tables in file_data.values()
+                     for v in tables.values() if isinstance(v, list))
+    print(green(f"OK  ({len(file_data)} ADOM(s), {total_objs} objects)"))
+
+    # ── pick source ADOM from file ────────────────────────────────────────────
+    source_adom = _pick_source_adom_from_file(file_data)
+    adom_data   = file_data[source_adom]
+
+    # ── pick target ADOM on the live FMG ─────────────────────────────────────
+    target_adom = _pick_target_adom(client)
+    _ensure_adom(client, target_adom)
+
+    # ── object scope selection (reuse the same interactive picker as extract) ──
+    print()
+    print(bold("  " + "─" * 48))
+    tables_selected = select_tables_interactive()
+    if tables_selected is None:
+        return  # user went back
+
+    selected_names = {t["name"] for t in tables_selected}
+
+    # ── summary before push ───────────────────────────────────────────────────
+    tables_to_push = {k: v for k, v in adom_data.items()
+                      if v and k in selected_names}
+    total_entries  = sum(len(v) for v in tables_to_push.values())
+
+    print()
+    print(bold("  " + "─" * 48))
+    print(f"  Source ADOM : {cyan(display_name(source_adom))}")
+    print(f"  Target ADOM : {cyan(display_name(target_adom))}")
+    print(f"  Tables      : {len(tables_to_push)}")
+    print(f"  Objects     : {total_entries}")
+    print()
+
+    confirm = input(f"  Proceed with restore? [{green('Y')}/n]: ").strip().lower()
+    if confirm in ("n", "no"):
+        print(dim("  Cancelled."))
+        return
+
+    # ── push ──────────────────────────────────────────────────────────────────
+    total_tables  = len(tables_to_push)
+    total_objects = sum(len(v) for v in tables_to_push.values())
+    results       = {}
+    done          = 0
+    obj_done      = 0
+    t_start       = time.time()
+    bar_width     = 28
+
+    def _render(t_done, t_total, o_pushed, o_errors, o_total, name, final=False):
+        """Render one progress line. Uses object-level progress within a table."""
+        # Overall bar based on objects completed across all tables
+        total_done_objs = obj_done + o_pushed + o_errors
+        filled  = int(bar_width * total_done_objs / max(total_objects, 1))
+        bar     = "█" * filled + "░" * (bar_width - filled)
+        pct     = 100 * total_done_objs // max(total_objects, 1)
+
+        elapsed_so_far = time.time() - t_start
+        rate      = total_done_objs / elapsed_so_far if elapsed_so_far > 0 else 0
+        remaining = total_objects - total_done_objs
+        eta_str   = f"ETA {remaining/rate:.0f}s" if rate > 1 else ""
+
+        name_col = name[:36].ljust(36)
+        if final:
+            status = (green(f"{o_pushed:>4} pushed") if o_errors == 0
+                      else f"{green(str(o_pushed))} ok {red(str(o_errors))} err")
+            suffix = f"{status}  {dim(eta_str)}"
+        else:
+            chunk_pct = int(100 * (o_pushed + o_errors) / max(o_total, 1))
+            suffix    = dim(f"{o_pushed+o_errors}/{o_total} ({chunk_pct}%)  {eta_str}")
+
+        print(f"\r  [{bar}] {pct:>3}%  {cyan(name_col)} {suffix:<30}",
+              end="", flush=True)
+
+    print()
+    for table_name, entries in tables_to_push.items():
+        n        = len(entries)
+        name_col = table_name[:36].ljust(36)
+
+        # Show initial line before any requests fire
+        _render(done, total_tables, 0, 0, max(n, 1), table_name)
+
+        def make_cb(tname, n_entries):
+            def cb(p, e, total):
+                _render(done, total_tables, p, e, total, tname)
+            return cb
+
+        pushed, errors = _push_table(client, table_name, entries, target_adom,
+                                     False, progress_cb=make_cb(table_name, n))
+        results[table_name] = {"pushed": pushed, "errors": errors, "total": n}
+        obj_done += n
+        done     += 1
+
+        # Final line for this table
+        _render(done, total_tables, pushed, errors, n, table_name, final=True)
+
+    elapsed      = time.time() - t_start
+    total_pushed = sum(v["pushed"] for v in results.values())
+    total_errors = sum(v["errors"] for v in results.values())
+    print()
+    print(f"\n  Completed in {elapsed:.1f}s  |  "
+          f"{green(str(total_pushed))} pushed  "
+          f"{(red(str(total_errors)) if total_errors else dim('0'))} errors")
+
+    # ── report ────────────────────────────────────────────────────────────────
+    print(f"\n  {bold('Saving report...')}")
+    _write_push_report(results, source_adom, target_adom, False)
+    print(green("  Done.\n"))
+
+
+# ── mode selector ─────────────────────────────────────────────────────────────
+
+def pick_mode() -> str:
+    """Ask the user what they want to do after login."""
+    print()
+    print(bold("  What would you like to do?"))
+    print()
+    print(f"    {cyan('1')}  Extract ADOM objects  {dim('(save to JSON/CSV)')}")
+    print(f"    {cyan('2')}  Restore from file     {dim('(push objects to a target ADOM)')}")
+    print()
+    while True:
+        raw = input("  Select mode [1/2]: ").strip()
+        if raw in ("1", "extract", "e"):
+            return "extract"
+        if raw in ("2", "restore", "r"):
+            return "restore"
+        print(red("  Please enter 1 or 2."))
 
 
 def main() -> None:
@@ -1230,17 +1796,6 @@ def main() -> None:
         print(red("  Host and password are required."))
         sys.exit(1)
 
-    # ── table / category selection ─────────────────────────────────────────────
-    tables = select_tables(args.category)
-    if args.category:
-        print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
-    else:
-        adom_cnt = len(ADOM_TABLES)
-        ctrl_cnt = len(CONTROLLER_TABLES)
-        print(f"  Extracting {bold(str(adom_cnt))} ADOM object tables "
-              f"+ {bold(str(ctrl_cnt))} Controller Config tables "
-              f"= {bold(str(adom_cnt + ctrl_cnt))} total")
-
     # ── connect ────────────────────────────────────────────────────────────────
     print(f"\n  Connecting to {cyan(f'https://{host}:{port}')} ...", end="", flush=True)
     client = FMGClient(host, port, verify_ssl=args.verify_ssl)
@@ -1257,16 +1812,70 @@ def main() -> None:
         version, adom_enabled = client.get_sys_status()
         print(f"  FortiManager version: {cyan(version)}")
         if not adom_enabled:
-            print(f"  {dim('Admin Domain Configuration:' )} {yellow('Disabled')}")
+            print(f"  {dim('Admin Domain Configuration:')} {yellow('Disabled')}")
 
-        # ── main loop — repeat until user quits ───────────────────────────────
+        # ── mode loop ─────────────────────────────────────────────────────────
         while True:
+            mode = pick_mode()
+
             print()
             print(bold("  " + "─" * 48))
-            run_once(client, tables, args, adom_enabled)
+
+            if mode == "extract":
+                # ── Step 1: ADOM selection ────────────────────────────────────
+                adoms = select_adoms(client, args.adom, adom_enabled)
+                if adoms is None:
+                    continue  # user went back to mode menu
+
+                # ── Step 2: Object scope selection ───────────────────────────
+                if args.category:
+                    tables = select_tables(args.category)
+                    print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
+                else:
+                    tables = select_tables_interactive(ALL_TABLES)
+                    if tables is None:
+                        continue  # user went back to mode menu
+
+                # ── Step 3: Extract ───────────────────────────────────────────
+                while True:
+                    completed = run_once(client, adoms, tables, args)
+                    if not completed:
+                        break
+                    print("  " + "─" * 48)
+                    choice = input(
+                        f"  Extract again? [{green('Y')} same scope / "
+                        f"{cyan('a')} change ADOM / "
+                        f"{cyan('o')} change objects / "
+                        f"{dim('n')} back to menu]: "
+                    ).strip().lower()
+                    if choice in ("n", "no", "q", "quit", "exit"):
+                        break
+                    elif choice in ("a", "adom"):
+                        # re-pick ADOM, keep same object scope
+                        adoms = select_adoms(client, None, adom_enabled)
+                        if adoms is None:
+                            break
+                    elif choice in ("o", "obj", "objects"):
+                        # re-pick object scope, keep same ADOMs
+                        tables = select_tables_interactive(ALL_TABLES)
+                        if tables is None:
+                            break
+                    # default (Y/Enter): re-run with same adoms + tables
+
+            else:  # restore
+                while True:
+                    mode_restore(client)
+                    print("  " + "─" * 48)
+                    again = input(
+                        f"  Restore to another ADOM? [{green('Y')}/n]: "
+                    ).strip().lower()
+                    if again in ("n", "no", "q", "quit", "exit"):
+                        break
 
             print("  " + "─" * 48)
-            again = input(f"  Run again for a different ADOM? [{green('Y')}/n]: ").strip().lower()
+            again = input(
+                f"  Return to main menu? [{green('Y')}/n]: "
+            ).strip().lower()
             if again in ("n", "no", "q", "quit", "exit"):
                 break
 
