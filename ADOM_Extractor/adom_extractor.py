@@ -2383,13 +2383,10 @@ def _fetch_package(client: FMGClient, adom: str, pkg: dict,
     """
     result = {}
 
-    # Policy types that support per-entry installation targets (scope member)
-    _SCOPE_TABLES = {"central/dnat", "central/dnat6"}
-
     for tbl in tables:
         url = tbl["url"].format(adom=adom, pkg=pkg["path"])
-        with_scope = tbl["name"] in _SCOPE_TABLES
-        entries, code = client.get_table(url, with_scope=with_scope)
+        # Always fetch with scope member — captures per-policy install targets
+        entries, code = client.get_table(url, with_scope=True)
         if code == 0 and entries:
             # Embed anomaly sub-tables into DoS policy entries
             if tbl["name"] in ("firewall/DoS-policy", "firewall/DoS-policy6"):
@@ -2641,16 +2638,12 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
     errors_all  = 0
     all_failed  = []
 
-    # Policy types that carry per-entry scope member (install targets)
-    _SCOPE_PUSH_TABLES = {"central/dnat", "central/dnat6"}
-
-    def _push_policy_list(url, policies, context, tbl_name=""):
+    def _push_policy_list(url, policies, context, tbl_name="", with_scope=True):
         nonlocal pushed_all, errors_all
         batch = []
         for p in policies:
             clean = {k: v for k, v in p.items() if k not in _POLICY_STRIP}
-            # Preserve scope member for tables that support per-entry install targets
-            if tbl_name not in _SCOPE_PUSH_TABLES:
+            if not with_scope:
                 clean.pop("scope member", None)
             batch.append(clean)
         if not batch:
@@ -2762,7 +2755,6 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
                     anomalies = pol.pop("_anomaly", None)
                     clean     = {k: v for k, v in pol.items() if k not in _POLICY_STRIP}
                     pid       = clean.get("policyid")
-                    # Push the DoS policy itself
                     r    = client._call("set", [{"url": url, "data": [clean]}])
                     code = r.get("result", [{}])[0].get("status", {}).get("code", -1)
                     if code == 0:
@@ -2775,7 +2767,6 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
                             "code":     code,
                             "message":  r.get("result", [{}])[0].get("status", {}).get("message", ""),
                         })
-                    # Push anomaly sub-table if present
                     if anomalies and pid is not None:
                         anom_url   = f"{url}/{pid}/anomaly"
                         anom_batch = [{k: v for k, v in a.items()
@@ -2783,7 +2774,28 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
                         client._call("set", [{"url": anom_url, "data": anom_batch}])
                 continue
 
-            _push_policy_list(url, data, f"{pkg_path}/{tbl_name}", tbl_name)
+            # Push with scope member first
+            prev_errors = errors_all
+            _push_policy_list(url, data, f"{pkg_path}/{tbl_name}", tbl_name,
+                              with_scope=True)
+            new_errors = errors_all - prev_errors
+
+            # If any failed and scope members are present in the data, offer retry
+            if new_errors > 0 and any(p.get("scope member") for p in data):
+                print()
+                print(yellow(f"  ⚠  {new_errors} policy/ies failed in '{pkg_path}/{tbl_name}'."))
+                print(f"  {dim('This may be because the installation target devices do not exist in the target ADOM.')}")
+                retry = input(
+                    f"  Retry without installation targets (scope member)? [{green('Y')}/n]: "
+                ).strip().lower()
+                if retry not in ("n", "no"):
+                    # Reset the errors from failed scope attempt
+                    errors_all  -= new_errors
+                    pushed_all  -= (len(data) - new_errors)  # remove partial successes
+                    all_failed   = [f for f in all_failed
+                                    if f.get("context") != f"{pkg_path}/{tbl_name}"]
+                    _push_policy_list(url, data, f"{pkg_path}/{tbl_name}", tbl_name,
+                                      with_scope=False)
 
     # Restore policy blocks
     pblock_data = payload.get("pblocks", {})
