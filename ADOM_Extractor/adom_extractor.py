@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-FortiManager ADOM Object Extractor
-Connects to a FortiManager via JSON-RPC API and extracts all ADOM-level objects
-across every ADOM, based on the 228 root-level table endpoints from FMG 7.6.6.
+FortiManager ADOM Object Extractor & Restorer
+
+Connects to a FortiManager via JSON-RPC API and lets you:
+  - Extract all ADOM-level objects to JSON/CSV files
+  - Restore objects from a previously extracted file into any target ADOM
+
+Supports FMG 7.6.6, 288 object types (ADOM + Controller Config).
 
 Usage:
     python3 fmg_adom_extractor.py
-    python3 fmg_adom_extractor.py --adom root        # single ADOM
-    python3 fmg_adom_extractor.py --category firewall # single category
-    python3 fmg_adom_extractor.py --out results.json  # custom output file
+    python3 fmg_adom_extractor.py --adom root            # pre-select ADOM
+    python3 fmg_adom_extractor.py --category firewall    # extract one category
+    python3 fmg_adom_extractor.py --out backup.json      # custom output path
+    python3 fmg_adom_extractor.py --list-categories      # show all categories
 """
 
 import argparse
@@ -21,7 +26,7 @@ import urllib.error
 import ssl
 from datetime import datetime, timezone
 
-# ── colours (disabled on Windows or non-TTY) ──────────────────────────────────
+# Terminal colour helpers — disabled automatically on Windows or non-TTY output
 USE_COLOUR = sys.stdout.isatty() and os.name != "nt"
 
 def _c(code, text):
@@ -668,8 +673,75 @@ CONTROLLER_TABLES = [
 
 CONTROLLER_CATEGORIES = sorted(set(t['name'].split('/')[0] for t in CONTROLLER_TABLES))
 
+# Policy package table definitions — 24 policy types from FMG 7.6.6
+# URL pattern: /pm/config/adom/{adom}/pkg/{pkg}/<policy_type>
+POLICY_TABLES = [
+    # Main firewall policies
+    {"name": "firewall/policy",               "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy",               "description": "IPv4/IPv6 firewall policies."},
+    {"name": "firewall/security-policy",      "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/security-policy",      "description": "NGFW security policies."},
+    {"name": "firewall/proxy-policy",         "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/proxy-policy",         "description": "Explicit proxy policies."},
 
-# ── FortiManager JSON-RPC client ───────────────────────────────────────────────
+    # DoS policies — anomaly sub-tables are fetched automatically per policy
+    {"name": "firewall/DoS-policy",           "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/DoS-policy",           "description": "IPv4 DoS policies (includes anomaly rules)."},
+    {"name": "firewall/DoS-policy6",          "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/DoS-policy6",          "description": "IPv6 DoS policies (includes anomaly rules)."},
+
+    # ACL and interface policies
+    {"name": "firewall/acl",                  "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/acl",                  "description": "IPv4 interface ACL policies."},
+    {"name": "firewall/acl6",                 "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/acl6",                 "description": "IPv6 interface ACL policies."},
+    {"name": "firewall/interface-policy",     "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/interface-policy",     "description": "IPv4 interface-based policies."},
+    {"name": "firewall/interface-policy6",    "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/interface-policy6",    "description": "IPv6 interface-based policies."},
+
+    # NAT and routing
+    {"name": "firewall/central-snat-map",     "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/central-snat-map",     "description": "Central SNAT rules."},
+    {"name": "central/dnat",                  "url": "/pm/config/adom/{adom}/pkg/{pkg}/central/dnat",                  "description": "Central DNAT rules."},
+    {"name": "central/dnat6",                 "url": "/pm/config/adom/{adom}/pkg/{pkg}/central/dnat6",                 "description": "Central IPv6 DNAT rules."},
+
+    # Local-in and multicast
+    {"name": "firewall/local-in-policy",      "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/local-in-policy",      "description": "IPv4 local-in policies."},
+    {"name": "firewall/local-in-policy6",     "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/local-in-policy6",     "description": "IPv6 local-in policies."},
+    {"name": "firewall/multicast-policy",     "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/multicast-policy",     "description": "IPv4 multicast policies."},
+    {"name": "firewall/multicast-policy6",    "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/multicast-policy6",    "description": "IPv6 multicast policies."},
+
+    # Traffic shaping
+    {"name": "firewall/shaping-policy",       "url": "/pm/config/adom/{adom}/pkg/{pkg}/firewall/shaping-policy",       "description": "Traffic shaping policies."},
+
+    # Authentication
+    {"name": "authentication/rule",           "url": "/pm/config/adom/{adom}/pkg/{pkg}/authentication/rule",           "description": "Authentication rules."},
+
+    # Other
+    {"name": "user/nac-policy",               "url": "/pm/config/adom/{adom}/pkg/{pkg}/user/nac-policy",               "description": "NAC policies."},
+    {"name": "videofilter/youtube-key",       "url": "/pm/config/adom/{adom}/pkg/{pkg}/videofilter/youtube-key",       "description": "YouTube filter keys."},
+
+    # Global header/footer policies (prepended/appended across all devices)
+    {"name": "global/header/policy",          "url": "/pm/config/adom/{adom}/pkg/{pkg}/global/header/policy",          "description": "Global header policies."},
+    {"name": "global/header/shaping-policy",  "url": "/pm/config/adom/{adom}/pkg/{pkg}/global/header/shaping-policy",  "description": "Global header shaping policies."},
+    {"name": "global/footer/policy",          "url": "/pm/config/adom/{adom}/pkg/{pkg}/global/footer/policy",          "description": "Global footer policies."},
+    {"name": "global/footer/shaping-policy",  "url": "/pm/config/adom/{adom}/pkg/{pkg}/global/footer/shaping-policy",  "description": "Global footer shaping policies."},
+]
+
+# Per-package single objects (not tables — fetched as one object per package)
+# authentication/setting and schedule are objects, not lists of entries
+POLICY_OBJECTS = [
+    {"name": "authentication/setting", "url": "/pm/config/adom/{adom}/pkg/{pkg}/authentication/setting",
+     "description": "Authentication settings for the package."},
+]
+
+# Policy types supported inside policy blocks
+PBLOCK_POLICY_TYPES = [
+    {"name": "firewall/policy",          "description": "IPv4/IPv6 firewall policies."},
+    {"name": "firewall/proxy-policy",    "description": "Explicit proxy policies."},
+    {"name": "firewall/security-policy", "description": "NGFW security policies."},
+]
+
+# Fields stripped when pushing policies to target.
+# "obj seq" is an internal sequence field FMG rejects on write.
+# Everything else (including _ prefixed stats fields) is accepted and ignored by FMG.
+_POLICY_STRIP = {"oid", "obj-ver", "uuid", "_image-base64", "obj seq", "obj flags"}
+
+
+
+
+# FortiManager JSON-RPC client
 
 class FMGClient:
     """Minimal FortiManager JSON-RPC over HTTPS client."""
@@ -683,7 +755,7 @@ class FMGClient:
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    # ── low-level ──────────────────────────────────────────────────────────────
+    # HTTP transport
 
     def _post(self, payload: dict) -> dict:
         data = json.dumps(payload).encode()
@@ -711,7 +783,7 @@ class FMGClient:
         resp = self._post(payload)
         return resp
 
-    # ── auth ───────────────────────────────────────────────────────────────────
+    # Authentication
 
     def login(self, username: str, password: str) -> None:
         resp = self._call("exec", [{"url": "/sys/login/user",
@@ -727,7 +799,7 @@ class FMGClient:
             self._call("exec", [{"url": "/sys/logout"}])
             self.session = None
 
-    # ── queries ────────────────────────────────────────────────────────────────
+    # API queries
 
     def get_adoms(self) -> list[dict]:
         """
@@ -795,23 +867,31 @@ class FMGClient:
 
         return filtered
 
-    def get_table(self, url: str) -> tuple[list, int]:
+    def get_table(self, url: str, with_scope: bool = False) -> tuple[list, int]:
         """
         Fetch all entries from a table URL (paginates automatically).
         Returns (entries, status_code).
 
         loadsub is intentionally omitted (defaults to 1) so that
         sub-objects such as dynamic_mapping are included in the response.
+
+        with_scope=True: also fetches per-entry scope member (install targets).
+        Use this for policy tables like central/dnat that support per-entry
+        installation targets.
         """
         all_entries = []
         offset = 0
         page_size = 500
 
         while True:
-            resp = self._call("get", [{
-                "url": url,
-                "range": [offset, page_size],
-            }])
+            params = {"url": url}
+            if with_scope:
+                # scope member option — no range, fetch all at once
+                params["option"] = "scope member"
+            else:
+                params["range"] = [offset, page_size]
+
+            resp = self._call("get", [params])
             result = resp.get("result", [{}])
             status = result[0].get("status", {})
             code = status.get("code", -1)
@@ -828,11 +908,58 @@ class FMGClient:
                 break
 
             all_entries.extend(data)
-            if len(data) < page_size:
+            # No pagination when using scope member option
+            if with_scope or len(data) < page_size:
                 break
             offset += page_size
 
         return all_entries, 0
+
+    def get_pblocks(self, adom: str) -> list[dict]:
+        """Return all policy blocks in an ADOM."""
+        url  = f"/pm/pblock/adom/{adom}"
+        resp = self._call("get", [{"url": url, "fields": ["name"]}])
+        data = resp.get("result", [{}])[0].get("data", [])
+        if not isinstance(data, list):
+            data = [data] if data else []
+        return [{"name": p.get("name", ""), "path": p.get("name", "")}
+                for p in data if p.get("name")]
+
+    def get_packages(self, adom: str) -> list[dict]:
+        """
+        Return all policy packages in an ADOM as a flat list.
+        Each entry has: name, path (full pkg_name_path), type, subpkgs.
+        Folders are traversed recursively so nested packages are included.
+        """
+        def _traverse(url: str, parent_path: str = "") -> list[dict]:
+            resp   = self._call("get", [{"url": url}])  # no fields filter — get everything
+            result = resp.get("result", [{}])
+            data   = result[0].get("data", [])
+            if not isinstance(data, list):
+                data = [data] if data else []
+            pkgs = []
+            for p in data:
+                name      = p.get("name", "")
+                pkg_type  = p.get("type", "pkg")
+                full_path = f"{parent_path}/{name}" if parent_path else name
+                pkgs.append({
+                    "name":             name,
+                    "path":             full_path,
+                    "type":             pkg_type,
+                    "package settings": p.get("package settings", {}),
+                    "scope member":     p.get("scope member", []),
+                })
+                # Recurse into folders
+                if pkg_type == "folder":
+                    sub_url = f"{url}/{name}"
+                    pkgs.extend(_traverse(sub_url, full_path))
+            return pkgs
+
+        if adom == "rootp":
+            base_url = "/pm/pkg/global"
+        else:
+            base_url = f"/pm/pkg/adom/{adom}"
+        return _traverse(base_url)
 
     def get_sys_status(self) -> tuple[str, bool]:
         """
@@ -848,7 +975,7 @@ class FMGClient:
         return version, adom_enabled
 
 
-# ── progress printer ───────────────────────────────────────────────────────────
+# Progress bar shown during extraction and restore
 
 class Progress:
     def __init__(self, total: int):
@@ -892,7 +1019,7 @@ class Progress:
               f"{red(str(self.errors))} errors")
 
 
-# ── core extraction ────────────────────────────────────────────────────────────
+# Extraction logic
 
 def build_url(tbl: dict, adom: str) -> str:
     """
@@ -947,7 +1074,7 @@ def run_extraction(client: FMGClient, adoms: list[str],
     return output
 
 
-# ── output writers ─────────────────────────────────────────────────────────────
+# Output file writers
 
 def _sanitize_filename(name: str) -> str:
     """Replace characters that are unsafe in filenames."""
@@ -960,7 +1087,7 @@ def write_json_per_adom(data: dict, out_stem: str, no_csv: bool) -> None:
     for adom, tables in data["data"].items():
         safe = _sanitize_filename(display_name(adom))
 
-        # ── per-ADOM payload ──────────────────────────────────────────────────
+        # Build a self-contained payload for this ADOM
         adom_payload = {
             "metadata": {
                 **{k: v for k, v in data["metadata"].items() if k != "adoms"},
@@ -1010,7 +1137,7 @@ def write_summary(data: dict) -> None:
     print()
 
 
-# ── CLI prompt helpers ─────────────────────────────────────────────────────────
+# CLI prompt helpers
 
 def prompt(label: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
@@ -1077,14 +1204,15 @@ def select_adoms(client: FMGClient, adom_filter: str | None,
     print(f"  {dim('Fetching ADOM list...')}", end=" ", flush=True)
 
     if adom_enabled:
-        all_adoms = client.get_adoms()
+        raw_adoms = client.get_adoms()
+        names     = [a["name"] for a in raw_adoms]
+        if "root" not in names:
+            raw_adoms = [{"name": "root", "version": ""}] + raw_adoms
     else:
-        # ADOMs disabled — only root exists
-        all_adoms = ["root"]
+        raw_adoms = [{"name": "root", "version": ""}]
 
-    # Ensure root is always in the list (sometimes not returned by API)
-    if "root" not in all_adoms and adom_enabled:
-        all_adoms = ["root"] + all_adoms
+    all_adoms = [a["name"]    for a in raw_adoms]
+    adom_vers = [a["version"] for a in raw_adoms]
 
     print(green(f"{len(all_adoms)} found"))
 
@@ -1365,7 +1493,7 @@ def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] |
     return select_tables_interactive()
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+# Entry point
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1405,11 +1533,11 @@ def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
     Returns True on completion, False on error.
     """
 
-    # ── extract ───────────────────────────────────────────────────────────────
+    # Run extraction
     fmg_version, _ = client.get_sys_status()
     result = run_extraction(client, adoms, tables, fmg_version)
 
-    # ── write output — one file per ADOM ─────────────────────────────────────
+    # Save one file per ADOM
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_stem = args.out.rstrip(".json") if args.out else f"fmg_adom_objects_{timestamp}"
 
@@ -1423,8 +1551,7 @@ def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
     return True
 
 
-# ── Restore (push) helpers ────────────────────────────────────────────────────
-# Inlined from fmg_adom_pusher.py so both modes share the live FMG session.
+# Restore helpers (push objects to a target ADOM)
 
 # Fields stripped from both the top-level object and each dynamic_mapping entry.
 _PUSH_STRIP = {"oid", "obj-ver", "uuid", "_image-base64"}
@@ -1956,7 +2083,7 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
                  dry_run: bool = False) -> None:
     """Interactive restore-from-file flow using the live client session."""
 
-    # ── pick file ─────────────────────────────────────────────────────────────
+    # Select the JSON file to restore from
     json_file = _pick_restore_file()
     if not os.path.isfile(json_file):
         print(red(f"  File not found: {json_file}"))
@@ -1979,18 +2106,18 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
                      for v in tables.values() if isinstance(v, list))
     print(green(f"OK  ({len(file_data)} ADOM(s), {total_objs} objects)"))
 
-    # ── pick source ADOM from file ────────────────────────────────────────────
+    # Pick which ADOM from the file to restore
     source_adom = _pick_source_adom_from_file(file_data)
     adom_data   = file_data[source_adom]
 
-    # ── pick target ADOM on the live FMG ─────────────────────────────────────
+    # Pick target ADOM on the connected FMG
     source_version = payload.get("metadata", {}).get("fmg_version", "")
     target_adom    = _pick_target_adom(client, source_version, adom_enabled)
     if target_adom is None:
         return  # user went back
     _ensure_adom(client, target_adom)
 
-    # ── Steps 1 & 2 in a loop so "back" goes up one level ───────────────────
+    # Navigation loop — "back" at any step goes up one level
     step = 1  # 1=table scope, 2=object scope
     tables_selected = None
     tables_to_push  = None
@@ -2013,7 +2140,7 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
                 continue
             break  # both steps done
 
-    # ── summary before push ───────────────────────────────────────────────────
+    # Show a summary and ask the user to confirm before pushing
     total_entries = sum(len(v) for v in tables_to_push.values())
 
     print()
@@ -2055,7 +2182,7 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
         print(dim("  Cancelled."))
         return
 
-    # ── push ──────────────────────────────────────────────────────────────────
+    # Push objects to target ADOM
     total_tables  = len(tables_to_push)
     total_objects = sum(len(v) for v in tables_to_push.values())
     results       = {}
@@ -2143,28 +2270,700 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
                 print(f"    {red('✗')}  {f['name'].ljust(col)}  {dim(msg)}")
             print()
 
-    # ── report ────────────────────────────────────────────────────────────────
+    # Save push report
     print(f"  {bold('Saving report...')}")
     _write_push_report(results, source_adom, target_adom, False)
     print(green("  Done.\n"))
 
 
-# ── mode selector ─────────────────────────────────────────────────────────────
 
-def pick_mode() -> str:
-    """Ask the user what they want to do after login."""
+def _pick_packages(client: FMGClient, adom: str,
+                   label: str = "Select policy package(s)") -> list[dict] | None:
+    """
+    Show all policy packages in the ADOM and let the user pick one, many, or all.
+    Returns a list of package dicts, or None if the user goes back.
+    Folders are shown but cannot be selected directly (their children can be).
+    """
+    print(f"  {dim('Fetching policy packages...')}", end=" ", flush=True)
+    pkgs = client.get_packages(adom)
+    actual = [p for p in pkgs if p["type"] != "folder"]
+
+    if not actual:
+        print(red("none found."))
+        print(red(f"  No policy packages found in ADOM '{display_name(adom)}'."))
+        return None
+
+    print(green(f"{len(actual)} found"))
+    print()
+    print(bold(f"  {label}"))
+    print()
+
+    col = max(len(p["path"]) for p in actual)
+    for i, p in enumerate(actual, 1):
+        indent = "  " * p["path"].count("/")
+        print(f"  {cyan(str(i).ljust(3))}  {indent}{p['path'].ljust(col)}")
+
+    print()
+    print(f"  Enter number(s), e.g. {dim('1')} or {dim('1,3')} — or press {dim('Enter')} for all.")
+    print(f"  Type {dim('back')} to go back.")
+    print()
+
+    while True:
+        raw = input("  Selection > ").strip()
+
+        if raw.lower() in ("back", "b", "q"):
+            return None
+
+        if raw == "" or raw.lower() == "all":
+            print(f"  Selected: {cyan('all')} ({len(actual)} packages)")
+            return actual
+
+        selected = []
+        invalid  = []
+        seen     = set()
+        for token in (t.strip() for t in raw.split(",") if t.strip()):
+            if token.isdigit():
+                idx = int(token) - 1
+                if 0 <= idx < len(actual):
+                    if idx not in seen:
+                        seen.add(idx)
+                        selected.append(actual[idx])
+                else:
+                    invalid.append(token)
+            elif token in [p["path"] for p in actual]:
+                match = next(p for p in actual if p["path"] == token)
+                if match["path"] not in seen:
+                    seen.add(match["path"])
+                    selected.append(match)
+            else:
+                invalid.append(token)
+
+        if invalid:
+            print(red(f"  Unknown: {', '.join(invalid)} — try again."))
+            continue
+        if not selected:
+            print(red("  Nothing selected — try again."))
+            continue
+
+        names = ", ".join(p["path"] for p in selected)
+        print(f"  Selected: {cyan(names)}")
+        return selected
+
+
+def _fetch_dos_anomalies(client: FMGClient, base_url: str,
+                         dos_policies: list) -> list:
+    """
+    Fetch anomaly sub-tables for each DoS policy and embed them inline.
+    FMG stores DoS anomaly rules at:
+      /pm/config/adom/{adom}/pkg/{pkg}/firewall/DoS-policy/{policyid}/anomaly
+    We embed them as "anomaly" inside each DoS policy entry so the full
+    config is preserved and can be restored as a single unit.
+    """
+    enriched = []
+    for pol in dos_policies:
+        pid  = pol.get("policyid", pol.get("oid"))
+        pol  = dict(pol)  # copy
+        if pid is not None:
+            anom_url             = f"{base_url}/{pid}/anomaly"
+            anomalies, code      = client.get_table(anom_url)
+            if code == 0 and anomalies:
+                pol["_anomaly"] = anomalies
+        enriched.append(pol)
+    return enriched
+
+
+def _fetch_package(client: FMGClient, adom: str, pkg: dict,
+                   tables: list[dict]) -> dict:
+    """
+    Fetch all policy types for one package.
+    Also fetches:
+      - authentication/setting (single object, not a list)
+      - DoS anomaly sub-tables embedded inside each DoS policy
+    Returns {policy_type: entries_or_object}.
+    """
+    result = {}
+
+    # Policy types that support per-entry installation targets (scope member)
+    _SCOPE_TABLES = {"central/dnat", "central/dnat6"}
+
+    for tbl in tables:
+        url = tbl["url"].format(adom=adom, pkg=pkg["path"])
+        with_scope = tbl["name"] in _SCOPE_TABLES
+        entries, code = client.get_table(url, with_scope=with_scope)
+        if code == 0 and entries:
+            # Embed anomaly sub-tables into DoS policy entries
+            if tbl["name"] in ("firewall/DoS-policy", "firewall/DoS-policy6"):
+                base = url
+                entries = _fetch_dos_anomalies(client, base, entries)
+            result[tbl["name"]] = entries
+
+    # Fetch per-package single objects (e.g. authentication/setting)
+    # authentication/setting is only valid in profile-based ngfw-mode
+    ngfw_mode = pkg.get("package settings", {}).get("ngfw-mode", "profile-based")
+    for obj in POLICY_OBJECTS:
+        if obj["name"] == "authentication/setting" and ngfw_mode == "policy-based":
+            continue
+        url  = obj["url"].format(adom=adom, pkg=pkg["path"])
+        resp = client._call("get", [{"url": url}])
+        data = resp.get("result", [{}])[0].get("data")
+        if data and isinstance(data, dict):
+            result[obj["name"]] = data  # single object, stored as dict not list
+
+    return result
+
+
+def mode_policy(client: FMGClient, adom_enabled: bool) -> None:
+    """Mode 3 — Policy Package export / import."""
+
+    while True:
+        print()
+        print(bold("  Policy Package"))
+        print()
+        print(f"  {cyan('1')}  Export policy packages  {dim('(save to JSON)')}")
+        print(f"  {cyan('2')}  Import policy packages  {dim('(restore from JSON)')}")
+        print()
+        print(f"  Type {dim('back')} to return to the main menu.")
+        print()
+
+        raw = input("  Selection [1/2]: ").strip().lower()
+        if raw in ("back", "b", "q"):
+            return
+        if raw in ("1", "export", "e"):
+            _policy_export(client, adom_enabled)
+        elif raw in ("2", "import", "i"):
+            _policy_import(client, adom_enabled)
+        else:
+            print(red("  Please enter 1 or 2."))
+
+        print("  " + "─" * 48)
+        again = input(f"  Policy Package menu again? [{green('Y')}/n]: ").strip().lower()
+        if again in ("n", "no", "q"):
+            return
+
+
+def _fetch_pblock_policies(client: FMGClient, adom: str, pblock_name: str) -> dict:
+    """Fetch all supported policy types from a policy block."""
+    result = {}
+    for ptype in PBLOCK_POLICY_TYPES:
+        url = f"/pm/config/adom/{adom}/pblock/{pblock_name}/{ptype['name']}"
+        entries, code = client.get_table(url)
+        if code == 0 and entries:
+            result[ptype["name"]] = entries
+    return result
+
+
+def _policy_export(client: FMGClient, adom_enabled: bool) -> None:
+    """Export policy packages and policy blocks from a source ADOM to JSON."""
+
+    # Pick source ADOM
+    print()
+    print(bold("  " + "─" * 48))
+    adoms = select_adoms(client, None, adom_enabled)
+    if adoms is None or not adoms:
+        return
+    if len(adoms) > 1:
+        print(yellow("  Policy export works one ADOM at a time. Using first selection."))
+    adom = adoms[0]
+
+    # Pick packages
+    print()
+    print(bold("  " + "─" * 48))
+    packages = _pick_packages(client, adom, "Select packages to export")
+    if packages is None:
+        return
+
+    # Pick policy types
+    print()
+    print(bold("  " + "─" * 48))
+    tables = _pick_policy_types()
+    if tables is None:
+        return
+
+    # Fetch policy blocks too
+    print(f"  {dim('Fetching policy blocks...')}", end=" ", flush=True)
+    pblocks = client.get_pblocks(adom)
+    print(green(f"{len(pblocks)} found") if pblocks else dim("none"))
+
+    print()
+    total_pkgs = len(packages)
+    print(f"  Exporting {bold(str(total_pkgs))} package(s) "
+          f"x {bold(str(len(tables)))} policy type(s) "
+          f"+ {bold(str(len(pblocks)))} policy block(s) "
+          f"from ADOM {cyan(display_name(adom))}")
+    print()
+
+    output = {
+        "metadata": {
+            "exported_at":  datetime.now(timezone.utc).isoformat(),
+            "fmg_version":  client.get_sys_status()[0],
+            "source_adom":  adom,
+            "packages":     [p["path"] for p in packages],
+            "policy_types": [t["name"] for t in tables],
+            "pblocks":      [p["name"] for p in pblocks],
+        },
+        "packages": packages,   # full metadata: name, path, type, package settings, scope member
+        "data":    {},
+        "pblocks": {},
+    }
+
+    bar_width = 30
+    t_start   = time.time()
+    total_pol = 0
+
+    for i, pkg in enumerate(packages, 1):
+        filled = int(bar_width * i / total_pkgs)
+        bar    = "█" * filled + "░" * (bar_width - filled)
+        pct    = 100 * i // total_pkgs
+        print(f"\r  [{bar}] {pct:>3}%  {cyan(pkg['path'][:40].ljust(40))}",
+              end="", flush=True)
+        pkg_data = _fetch_package(client, adom, pkg, tables)
+        output["data"][pkg["path"]] = pkg_data
+        total_pol += sum(len(v) for v in pkg_data.values())
+
+    if pblocks:
+        print(f"\n  Exporting policy blocks...")
+        for pb in pblocks:
+            pb_data = _fetch_pblock_policies(client, adom, pb["name"])
+            output["pblocks"][pb["name"]] = pb_data
+            pb_count = sum(len(v) for v in pb_data.values())
+            total_pol += pb_count
+            print(f"    {cyan(pb['name']):<30} {pb_count} policies")
+
+    elapsed = time.time() - t_start
+    print(f"\n  Fetched {green(str(total_pol))} policies total in {elapsed:.1f}s")
+    # Save file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname     = f"fmg_policy_{timestamp}_{safe_adom}.json"
+
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, default=str)
+
+    size_kb = os.path.getsize(fname) / 1024
+    print(f"  {green('✓')} Saved → {bold(fname)}  ({size_kb:.0f} KB)")
+
+
+def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
+    """Import policy packages from a JSON file into a target ADOM."""
+
+    # Dependency warning
+    print()
+    print(f"  {yellow('⚠  Important — dependency order')}")
+    print(f"  {dim('Policy packages reference ADOM objects (addresses, VIPs, services, users, etc.)')}")
+    print(f"  {dim('Make sure you have already imported ADOM objects into the target ADOM')}")
+    print(f"  {dim('(Import → ADOM objects) before importing policies.')}")
+    print(f"  {dim('If referenced objects are missing, policies will fail with "data not exist" errors.')}")
+    print()
+    confirm = input(f"  ADOM objects already imported? [{green('Y')} to continue / {dim('n')} to cancel]: ").strip().lower()
+    if confirm in ("n", "no"):
+        print(dim("  Cancelled. Please import ADOM objects first."))
+        return
+    print()
+
+    # Pick file
+    candidates = sorted(
+        f for f in os.listdir(".")
+        if f.startswith("fmg_policy") and f.endswith(".json")
+    )
+    if candidates:
+        print()
+        print(f"  Available policy export files:")
+        for i, f in enumerate(candidates, 1):
+            size_kb = os.path.getsize(f) / 1024
+            print(f"    {cyan(str(i))}  {f}  {dim(f'({size_kb:.0f} KB)')}")
+        print()
+        raw = input("  Select file (number or path): ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return
+        if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+            fname = candidates[int(raw) - 1]
+        else:
+            fname = raw
+    else:
+        fname = input("  Path to policy JSON file: ").strip()
+        if not fname:
+            return
+
+    if not os.path.isfile(fname):
+        print(red(f"  File not found: {fname}"))
+        return
+
+    print(f"  Loading {cyan(fname)} ...", end=" ", flush=True)
+    with open(fname, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    file_data = payload.get("data", {})
+    meta      = payload.get("metadata", {})
+    if not file_data:
+        print(red("  No policy data found in file."))
+        return
+
+    total_pol = sum(len(v) for pkg in file_data.values()
+                    for v in pkg.values() if isinstance(v, list))
+    print(green(f"OK  ({len(file_data)} package(s), {total_pol} policies)"))
+
+    src_version = meta.get("fmg_version", "")
+    src_adom    = meta.get("source_adom", "")
+    print(f"  Source ADOM : {cyan(display_name(src_adom))}")
+    if src_version:
+        print(f"  Source FMG  : {cyan(src_version)}")
+    print()
+
+    # Pick target ADOM
+    print(bold("  " + "─" * 48))
+    target_adom = _pick_target_adom(client, src_version, adom_enabled)
+    if target_adom is None:
+        return
+    _ensure_adom(client, target_adom)
+
+    # Pick target package (must exist or will be created)
+    print()
+    print(bold("  " + "─" * 48))
+    print(f"  Packages in the export file:")
+    pkg_paths = list(file_data.keys())
+    for i, path in enumerate(pkg_paths, 1):
+        pol_count = sum(len(v) for v in file_data[path].values()
+                        if isinstance(v, list))
+        print(f"    {cyan(str(i))}  {path}  {dim(str(pol_count) + ' policies')}")
+
+    print()
+    print(f"  {dim('All packages will be imported. Press Enter to confirm or type back.')}")
+    raw = input("  > ").strip().lower()
+    if raw in ("back", "b", "q"):
+        return
+
+    # Ensure each target package exists, then push policies
+    print()
+    bar_width   = 30
+    total_pkgs  = len(pkg_paths)
+    t_start     = time.time()
+    pushed_all  = 0
+    errors_all  = 0
+    all_failed  = []
+
+    # Policy types that carry per-entry scope member (install targets)
+    _SCOPE_PUSH_TABLES = {"central/dnat", "central/dnat6"}
+
+    def _push_policy_list(url, policies, context, tbl_name=""):
+        nonlocal pushed_all, errors_all
+        batch = []
+        for p in policies:
+            clean = {k: v for k, v in p.items() if k not in _POLICY_STRIP}
+            # Preserve scope member for tables that support per-entry install targets
+            if tbl_name not in _SCOPE_PUSH_TABLES:
+                clean.pop("scope member", None)
+            batch.append(clean)
+        if not batch:
+            return
+        resp = client._call("set", [{"url": url, "data": batch}])
+        code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+        if code == 0:
+            pushed_all += len(batch)
+        else:
+            for pol in batch:
+                r    = client._call("set", [{"url": url, "data": [pol]}])
+                res  = r.get("result", [{}])[0]
+                code = res.get("status", {}).get("code", -1)
+                if code == 0:
+                    pushed_all += 1
+                else:
+                    errors_all += 1
+                    all_failed.append({
+                        "context":  context,
+                        "policyid": pol.get("policyid", pol.get("name", "?")),
+                        "code":     code,
+                        "message":  res.get("status", {}).get("message", ""),
+                    })
+
+    # Build a lookup: pkg_path -> pkg_meta (settings + scope member)
+    pkg_meta_map = {p["path"]: p for p in payload.get("packages", [])}
+
+    for pi, pkg_path in enumerate(pkg_paths, 1):
+        pkg_data = file_data[pkg_path]
+        pkg_meta = pkg_meta_map.get(pkg_path)
+
+        # Try creating the package with full settings + scope member
+        code = _ensure_policy_package(client, target_adom, pkg_path, pkg_meta,
+                                      with_scope=True)
+
+        # If it failed and there are scope members, the device probably doesn't
+        # exist in the target ADOM. Ask if user wants to retry without scope.
+        if code not in (0, None):
+            scope_names = ([s.get("name", "?") for s in pkg_meta["scope member"]]
+                           if pkg_meta and pkg_meta.get("scope member") else [])
+            print()
+            print(red(f"  ✗ Failed to create package '{pkg_path}' "
+                      f"(code {code})."))
+            if scope_names:
+                print(yellow(f"  ⚠  This is likely because the installation "
+                             f"target(s) {scope_names} don't exist in "
+                             f"ADOM '{display_name(target_adom)}'."))
+            choice = input(
+                f"  Retry without installation target (scope member)? [{green('Y')}/n]: "
+            ).strip().lower()
+            if choice not in ("n", "no"):
+                code = _ensure_policy_package(client, target_adom, pkg_path,
+                                              pkg_meta, with_scope=False)
+                if code not in (0, None):
+                    print(red(f"  ✗ Still failed (code {code}). Skipping package."))
+                    continue
+            else:
+                print(dim(f"  Skipping package '{pkg_path}' and its policies."))
+                continue
+            print()
+
+        for tbl_name, data in pkg_data.items():
+            if not data:
+                continue
+
+            url   = f"/pm/config/adom/{target_adom}/pkg/{pkg_path}/{tbl_name}"
+            label = f"{pkg_path}/{tbl_name}"[:40].ljust(40)
+            filled = int(bar_width * pi / total_pkgs)
+            bar    = "█" * filled + "░" * (bar_width - filled)
+            pct    = 100 * pi // total_pkgs
+
+            # Single object (e.g. authentication/setting) — use set directly
+            if isinstance(data, dict):
+                # Strip read-only fields AND empty/null values — FMG rejects
+                # some empty list fields on single-object endpoints
+                clean = {k: v for k, v in data.items()
+                         if k not in _POLICY_STRIP
+                         and v is not None
+                         and v != []}
+                print(f"\r  [{bar}] {pct:>3}%  {cyan(label)}  {dim('(object)')}  ",
+                      end="", flush=True)
+                resp = client._call("set", [{"url": url, "data": clean}])
+                code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+                msg  = resp.get("result", [{}])[0].get("status", {}).get("message", "")
+                if code == 0:
+                    pushed_all += 1
+                elif code == -6 and "invalid url" in msg.lower():
+                    # Target package doesn't support this object (e.g. authentication/setting
+                    # not applicable for this ngfw-mode) — skip silently
+                    pass
+                else:
+                    errors_all += 1
+                    all_failed.append({
+                        "context":  f"{pkg_path}/{tbl_name}",
+                        "policyid": tbl_name,
+                        "code":     code,
+                        "message":  msg,
+                    })
+                continue
+
+            # Table of policies
+            print(f"\r  [{bar}] {pct:>3}%  {cyan(label)}  "
+                  f"{dim(str(len(data)) + ' policies')}  ",
+                  end="", flush=True)
+
+            # For DoS policies, push anomaly sub-tables after the main policy
+            if tbl_name in ("firewall/DoS-policy", "firewall/DoS-policy6"):
+                for pol in data:
+                    anomalies = pol.pop("_anomaly", None)
+                    clean     = {k: v for k, v in pol.items() if k not in _POLICY_STRIP}
+                    pid       = clean.get("policyid")
+                    # Push the DoS policy itself
+                    r    = client._call("set", [{"url": url, "data": [clean]}])
+                    code = r.get("result", [{}])[0].get("status", {}).get("code", -1)
+                    if code == 0:
+                        pushed_all += 1
+                    else:
+                        errors_all += 1
+                        all_failed.append({
+                            "context":  f"{pkg_path}/{tbl_name}",
+                            "policyid": pid or "?",
+                            "code":     code,
+                            "message":  r.get("result", [{}])[0].get("status", {}).get("message", ""),
+                        })
+                    # Push anomaly sub-table if present
+                    if anomalies and pid is not None:
+                        anom_url   = f"{url}/{pid}/anomaly"
+                        anom_batch = [{k: v for k, v in a.items()
+                                       if k not in _POLICY_STRIP} for a in anomalies]
+                        client._call("set", [{"url": anom_url, "data": anom_batch}])
+                continue
+
+            _push_policy_list(url, data, f"{pkg_path}/{tbl_name}", tbl_name)
+
+    # Restore policy blocks
+    pblock_data = payload.get("pblocks", {})
+    if pblock_data:
+        print(f"\n  Importing {bold(str(len(pblock_data)))} policy block(s)...")
+        for pb_name, pb_policies in pblock_data.items():
+            pb_base = f"/pm/pblock/adom/{target_adom}"
+            chk     = client._call("get", [{"url": f"{pb_base}/{pb_name}",
+                                            "fields": ["name"]}])
+            if chk.get("result", [{}])[0].get("status", {}).get("code", -1) != 0:
+                client._call("add", [{"url": pb_base,
+                                      "data": {"name": pb_name, "type": "pblock"}}])
+            for tbl_name, policies in pb_policies.items():
+                if not policies:
+                    continue
+                url = f"/pm/config/adom/{target_adom}/pblock/{pb_name}/{tbl_name}"
+                print(f"    {cyan(pb_name)}/{tbl_name}  "
+                      f"{dim(str(len(policies)) + ' policies')}")
+                _push_policy_list(url, policies, f"pblock:{pb_name}/{tbl_name}", tbl_name)
+
+    elapsed = time.time() - t_start
+    print()
+    print(f"\n  Completed in {elapsed:.1f}s  |  "
+          f"{green(str(pushed_all))} pushed  "
+          f"{(red(str(errors_all)) if errors_all else dim('0'))} errors")
+
+    if all_failed:
+        print()
+        print(bold(f"  {red('x')} Failed policies ({len(all_failed)}):"))
+        print()
+        for f in all_failed:
+            print(f"    {red('x')}  {f.get('context', '?')}  "
+                  f"policyid={f['policyid']}  {dim(f['message'])}")
+        print()
+
+    print(green("  Done.\n"))
+
+
+
+def _ensure_policy_package(client: FMGClient, adom: str, pkg_path: str,
+                           pkg_meta: dict | None = None,
+                           with_scope: bool = True) -> int:
+    """
+    Create a policy package (and any parent folders) if it doesn't exist.
+    pkg_meta: the exported package dict containing 'package settings' and 'scope member'.
+    with_scope: if False, scope member is omitted (used as fallback when device not found).
+    Returns the status code of the final add call (0 = success).
+    """
+    if adom == "rootp":
+        base = "/pm/pkg/global"
+    else:
+        base = f"/pm/pkg/adom/{adom}"
+
+    # Strip read-only fields from package settings
+    _PKG_STRIP = {"hitc-taskid", "hitc-timestamp"}
+    pkg_settings = {}
+    if pkg_meta and pkg_meta.get("package settings"):
+        pkg_settings = {k: v for k, v in pkg_meta["package settings"].items()
+                        if k not in _PKG_STRIP}
+
+    parts  = pkg_path.split("/")
+    built  = ""
+    last_code = 0
+    for i, part in enumerate(parts):
+        built     = f"{built}/{part}" if built else part
+        check_url = f"{base}/{built}"
+        resp      = client._call("get", [{"url": check_url, "fields": ["name", "type"]}])
+        code      = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+        if code != 0:
+            is_last    = (i == len(parts) - 1)
+            parent_url = f"{base}/{'/'.join(parts[:i])}" if i > 0 else base
+            data = {
+                "name": part,
+                "type": "folder" if not is_last else "pkg",
+            }
+            if is_last:
+                if pkg_settings:
+                    data["package settings"] = pkg_settings
+                if with_scope and pkg_meta and pkg_meta.get("scope member"):
+                    data["scope member"] = pkg_meta["scope member"]
+            r = client._call("add", [{"url": parent_url, "data": data}])
+            last_code = r.get("result", [{}])[0].get("status", {}).get("code", -1)
+    return last_code
+
+
+def _pick_policy_types() -> list[dict] | None:
+    """Let the user choose which policy types to export."""
+    print()
+    print(bold("  Policy types to export"))
+    print()
+    print(f"  {cyan('0')}  All policy types  {dim(f'({len(POLICY_TABLES)} types)')}")
+    print()
+
+    # Group by category
+    categories: dict[str, list] = {}
+    for t in POLICY_TABLES:
+        cat = t["name"].split("/")[0]
+        categories.setdefault(cat, []).append(t)
+
+    idx = 1
+    cat_map: dict[str, list] = {}
+    for cat, tables in categories.items():
+        print(f"  {dim('── ' + cat + ' ──────────────────────────────────────────────')}")
+        for t in tables:
+            print(f"  {cyan(str(idx).ljust(3))}  {t['name']:<40}  {dim(t['description'][:50])}")
+            cat_map[str(idx)] = [t]
+            idx += 1
+        print()
+
+    print(f"  Enter {dim('0')} for all, or number(s) e.g. {dim('1,3,5')}.")
+    print(f"  Type {dim('back')} to go back.")
+    print()
+
+    while True:
+        raw = input("  Selection > ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return None
+        if raw == "0" or raw.lower() == "all" or raw == "":
+            print(f"  Scope: {cyan('all')} ({len(POLICY_TABLES)} policy types)")
+            return POLICY_TABLES
+
+        selected = []
+        invalid  = []
+        seen     = set()
+        for token in (t.strip() for t in raw.split(",") if t.strip()):
+            if token in cat_map and token not in seen:
+                seen.add(token)
+                selected.extend(cat_map[token])
+            else:
+                invalid.append(token)
+
+        if invalid:
+            print(red(f"  Unknown: {', '.join(invalid)} — try again."))
+            continue
+        if not selected:
+            print(red("  Nothing selected — try again."))
+            continue
+
+        names = ", ".join(t["name"] for t in selected)
+        print(f"  Scope: {cyan(names)}")
+        return selected
+
+# Mode selector shown after login
+
+def pick_direction() -> str:
+    """Top-level menu: Export or Import."""
     print()
     print(bold("  What would you like to do?"))
     print()
-    print(f"    {cyan('1')}  Extract ADOM objects  {dim('(save to JSON/CSV)')}")
-    print(f"    {cyan('2')}  Restore from file     {dim('(push objects to a target ADOM)')}")
+    print(f"    {cyan('1')}  Export  {dim('(extract data from FMG to file)')}")
+    print(f"    {cyan('2')}  Import  {dim('(push data from file into FMG)')}")
     print()
     while True:
-        raw = input("  Select mode [1/2]: ").strip()
-        if raw in ("1", "extract", "e"):
-            return "extract"
-        if raw in ("2", "restore", "r"):
-            return "restore"
+        raw = input("  Select [1/2]: ").strip().lower()
+        if raw in ("1", "export", "e"):
+            return "export"
+        if raw in ("2", "import", "i"):
+            return "import"
+        print(red("  Please enter 1 or 2."))
+
+
+def pick_data_type(direction: str) -> str:
+    """Ask what type of data to export or import."""
+    verb = "Export" if direction == "export" else "Import"
+    print()
+    print(bold(f"  {verb} — what data?"))
+    print()
+    print(f"    {cyan('1')}  ADOM objects       {dim('(firewall addresses, services, users, etc.)')}")
+    print(f"    {cyan('2')}  Policy packages    {dim('(firewall policies, DoS, NAT, etc.)')}")
+    print()
+    print(f"  Type {dim('back')} to go back.")
+    print()
+    while True:
+        raw = input("  Select [1/2]: ").strip().lower()
+        if raw in ("back", "b", "q"):
+            return "back"
+        if raw in ("1", "objects", "o"):
+            return "objects"
+        if raw in ("2", "policy", "p", "policies"):
+            return "policy"
         print(red("  Please enter 1 or 2."))
 
 
@@ -2185,7 +2984,7 @@ def main() -> None:
 
     print_banner()
 
-    # ── gather connection details ──────────────────────────────────────────────
+    # Get connection details from CLI args or prompt
     print(bold("  Connection details"))
     print("  " + "─" * 48)
     host     = args.host     or prompt("FortiManager IP / hostname")
@@ -2197,7 +2996,7 @@ def main() -> None:
         print(red("  Host and password are required."))
         sys.exit(1)
 
-    # ── connect ────────────────────────────────────────────────────────────────
+    # Connect to FMG
     print(f"\n  Connecting to {cyan(f'https://{host}:{port}')} ...", end="", flush=True)
     client = FMGClient(host, port, verify_ssl=args.verify_ssl)
 
@@ -2215,63 +3014,80 @@ def main() -> None:
         if not adom_enabled:
             print(f"  {dim('Admin Domain Configuration:')} {yellow('Disabled')}")
 
-        # ── mode loop ─────────────────────────────────────────────────────────
+        # Main menu loop — runs until user chooses to exit
         while True:
-            mode = pick_mode()
+            direction = pick_direction()
 
-            print()
-            print(bold("  " + "─" * 48))
+            while True:
+                data_type = pick_data_type(direction)
+                if data_type == "back":
+                    break  # go back to direction picker
 
-            if mode == "extract":
-                # ── Step 1: ADOM selection ────────────────────────────────────
-                adoms = select_adoms(client, args.adom, adom_enabled)
-                if adoms is None:
-                    continue  # user went back to mode menu
+                print()
+                print(bold("  " + "─" * 48))
 
-                # ── Step 2: Object scope selection ───────────────────────────
-                if args.category:
-                    tables = select_tables(args.category)
-                    print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
-                else:
-                    tables = select_tables_interactive(ALL_TABLES)
-                    if tables is None:
-                        continue  # user went back to mode menu
-
-                # ── Step 3: Extract ───────────────────────────────────────────
-                while True:
-                    completed = run_once(client, adoms, tables, args)
-                    if not completed:
-                        break
-                    print("  " + "─" * 48)
-                    choice = input(
-                        f"  Extract again? [{green('Y')} same scope / "
-                        f"{cyan('a')} change ADOM / "
-                        f"{cyan('o')} change objects / "
-                        f"{dim('n')} back to menu]: "
-                    ).strip().lower()
-                    if choice in ("n", "no", "q", "quit", "exit"):
-                        break
-                    elif choice in ("a", "adom"):
-                        # re-pick ADOM, keep same object scope
-                        adoms = select_adoms(client, None, adom_enabled)
+                if direction == "export":
+                    if data_type == "objects":
+                        # Step 1: ADOM selection
+                        adoms = select_adoms(client, args.adom, adom_enabled)
                         if adoms is None:
-                            break
-                    elif choice in ("o", "obj", "objects"):
-                        # re-pick object scope, keep same ADOMs
-                        tables = select_tables_interactive(ALL_TABLES)
-                        if tables is None:
-                            break
-                    # default (Y/Enter): re-run with same adoms + tables
+                            continue
 
-            else:  # restore
-                while True:
-                    mode_restore(client, adom_enabled)
-                    print("  " + "─" * 48)
-                    again = input(
-                        f"  Restore to another ADOM? [{green('Y')}/n]: "
-                    ).strip().lower()
-                    if again in ("n", "no", "q", "quit", "exit"):
-                        break
+                        # Step 2: Object scope
+                        if args.category:
+                            tables = select_tables(args.category)
+                            print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
+                        else:
+                            tables = select_tables_interactive(ALL_TABLES)
+                            if tables is None:
+                                continue
+
+                        # Step 3: Extract loop
+                        while True:
+                            completed = run_once(client, adoms, tables, args)
+                            if not completed:
+                                break
+                            print("  " + "─" * 48)
+                            choice = input(
+                                f"  Extract again? [{green('Y')} same scope / "
+                                f"{cyan('a')} change ADOM / "
+                                f"{cyan('o')} change objects / "
+                                f"{dim('n')} back to menu]: "
+                            ).strip().lower()
+                            if choice in ("n", "no", "q", "quit", "exit"):
+                                break
+                            elif choice in ("a", "adom"):
+                                adoms = select_adoms(client, None, adom_enabled)
+                                if adoms is None:
+                                    break
+                            elif choice in ("o", "obj", "objects"):
+                                tables = select_tables_interactive(ALL_TABLES)
+                                if tables is None:
+                                    break
+
+                    else:  # policy export
+                        _policy_export(client, adom_enabled)
+
+                else:  # import
+                    if data_type == "objects":
+                        while True:
+                            mode_restore(client, adom_enabled)
+                            print("  " + "─" * 48)
+                            again = input(
+                                f"  Restore to another ADOM? [{green('Y')}/n]: "
+                            ).strip().lower()
+                            if again in ("n", "no", "q", "quit", "exit"):
+                                break
+
+                    else:  # policy import
+                        _policy_import(client, adom_enabled)
+
+                print("  " + "─" * 48)
+                again = input(
+                    f"  Back to {bold(direction.capitalize())} menu? [{green('Y')}/n]: "
+                ).strip().lower()
+                if again in ("n", "no", "q", "quit", "exit"):
+                    break
 
             print("  " + "─" * 48)
             again = input(
