@@ -1146,20 +1146,59 @@ def prompt(label: str, default: str = "") -> str:
 
 
 def prompt_password(label: str = "Password") -> str:
+    """
+    Read a password with masking.
+    - Real terminals: uses getpass.getpass() — no echo at all.
+    - PyCharm / non-TTY on Windows: uses msvcrt to echo '*' per character.
+    - PyCharm / non-TTY on other OS: falls back to plain input() with warning.
+    """
     import getpass
     prompt = f"  {label}: "
-    # PyCharm's embedded terminal doesn't support getpass (no raw TTY),
-    # so fall back to plain input() when running inside the IDE.
+
     in_pycharm = (
         "PYCHARM_HOSTED" in os.environ
         or "PYDEV_CONSOLE_EXECUTE_HOOK" in os.environ
     )
-    if in_pycharm:
-        return input(prompt)
-    try:
-        return getpass.getpass(prompt)
-    except Exception:
-        return input(prompt)
+
+    # Try standard getpass first (works on real TTY everywhere)
+    if not in_pycharm:
+        try:
+            return getpass.getpass(prompt)
+        except Exception:
+            pass  # fall through to platform-specific fallback
+
+    # PyCharm / non-TTY: use msvcrt on Windows for star-masked input
+    if os.name == "nt":
+        try:
+            import msvcrt
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            chars = []
+            while True:
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):   # Enter
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    break
+                elif ch == "\x08":       # Backspace
+                    if chars:
+                        chars.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                elif ch == "\x03":       # Ctrl-C
+                    raise KeyboardInterrupt
+                elif ch >= " ":          # printable character
+                    chars.append(ch)
+                    sys.stdout.write("*")
+                    sys.stdout.flush()
+            return "".join(chars)
+        except Exception:
+            pass  # fall through to plain input
+
+    # Last resort: plain input with warning
+    print(f"  {yellow('⚠  Masked input not available in this terminal.')}")
+    print(f"  {dim('Use PyCharm Terminal tab (Alt+F12) for hidden input.')}")
+    return input(prompt)
 
 
 def print_banner() -> None:
@@ -2940,6 +2979,426 @@ def _pick_policy_types() -> list[dict] | None:
 
 # Mode selector shown after login
 
+
+# IPsec template export uses action-list which contains everything nested
+# under value["vpn ipsec phase1-interface"], value["system interface"], etc.
+# On IMPORT however, FMG requires separate URLs for phase1 and phase2.
+# The _push_template function handles this split automatically.
+IPSEC_TEMPLATE_SUBS = [
+    {"name": "action-list", "url": "action-list"},
+]
+
+# Secret fields nested inside action-list/value — masked by FMG as ["ENC","..."]
+# Must be re-entered manually on the target FMG after import.
+_IPSEC_SECRET_PATHS = [
+    ("vpn ipsec phase1-interface", "psksecret"),
+    ("vpn ipsec phase1-interface", "ppk-secret"),
+    ("vpn ipsec phase1-interface", "group-authentication-secret"),
+]
+
+# SD-WAN overlay template sub-object
+# URL: /pm/config/adom/{adom}/template/_sdwan_overlay/{name}/sdwan/overlay
+SDWAN_OVERLAY_SUBS = [
+    {"name": "sdwan/overlay", "url": "sdwan/overlay"},
+]
+
+_TMPL_STRIP = {"oid", "obj-ver", "uuid", "_image-base64"}
+
+
+def _get_templates(client: FMGClient, adom: str, stype: str) -> list[dict]:
+    """List all templates of a given stype (_ipsec or _sdwan_overlay)."""
+    url  = f"/pm/template/{stype}/adom/{adom}"
+    resp = client._call("get", [{"url": url}])
+    data = resp.get("result", [{}])[0].get("data", [])
+    if not isinstance(data, list):
+        data = [data] if data else []
+    return [t for t in data if t.get("name")]
+
+
+def _fetch_template(client: FMGClient, adom: str, stype: str,
+                    name: str, subs: list[dict]) -> dict:
+    """
+    Fetch a template and all its sub-objects.
+    For IPsec templates, PSK and other secrets are masked by FMG as
+    ["ENC", "..."] — these are flagged in metadata and must be
+    re-entered manually after import.
+    """
+    result = {"name": name, "stype": stype, "subs": {}, "masked_secrets": []}
+    for sub in subs:
+        url = f"/pm/config/adom/{adom}/template/{stype}/{name}/{sub['url']}"
+        entries, code = client.get_table(url)
+        if code == 0 and entries:
+            # For IPsec templates: secrets are nested inside entry["value"]
+            if stype == "_ipsec" and sub["name"] == "action-list":
+                for entry in entries:
+                    val = entry.get("value", {}) or {}
+                    for nested_key, secret_field in _IPSEC_SECRET_PATHS:
+                        nested = val.get(nested_key, {}) or {}
+                        v = nested.get(secret_field)
+                        if isinstance(v, list) and v and v[0] == "ENC":
+                            tunnel = val.get("name", "?")
+                            result["masked_secrets"].append(
+                                f"{sub['name']}/{tunnel}/{secret_field}"
+                            )
+            result["subs"][sub["name"]] = entries
+    return result
+
+
+def _push_template(client: FMGClient, adom: str, tmpl: dict,
+                   subs: list[dict]) -> tuple[int, list]:
+    """
+    Create a template shell then push all sub-objects.
+
+    For IPsec templates the import URL structure differs from export:
+      Export: GET action-list returns everything nested in value
+      Import: must push action-list, phase1, and phase2 via separate URLs
+        - action-list  (tunnel basics + system interface)
+        - vpn/ipsec/phase1-interface  (from value["vpn ipsec phase1-interface"])
+        - vpn/ipsec/phase2-interface  (from value["vpn ipsec phase2-interface"])
+
+    Masked PSK/secret fields are stripped — user must re-enter them manually.
+    Returns (errors_count, failed_list).
+    """
+    stype  = tmpl["stype"]
+    name   = tmpl["name"]
+    errors = 0
+    failed = []
+
+    # Warn about masked secrets
+    masked = tmpl.get("masked_secrets", [])
+    if masked:
+        print()
+        print(yellow(f"  ⚠  Template '{name}' has masked secret field(s):"))
+        for m in masked:
+            print(f"     {dim(m)}")
+        print(f"  {dim('Set them manually on the target FMG after import.')}")
+        print()
+
+    # Create the template shell (with widgets for IPsec)
+    base_url = f"/pm/template/{stype}/adom/{adom}"
+    shell_setting = {"stype": stype}
+    if stype == "_ipsec":
+        shell_setting["widgets"] = [stype]
+    shell = {"name": name, "type": "template", "template setting": shell_setting}
+    resp = client._call("set", [{"url": base_url, "data": shell}])
+    code = resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+    if code not in (0,):
+        msg = resp.get("result", [{}])[0].get("status", {}).get("message", "")
+        failed.append({"name": name, "sub": "(shell)", "code": code, "message": msg})
+        errors += 1
+        return errors, failed
+
+    def _do_set(url, data_list, sub_label):
+        nonlocal errors
+        r    = client._call("set", [{"url": url, "data": data_list}])
+        code = r.get("result", [{}])[0].get("status", {}).get("code", -1)
+        if code == 0:
+            return
+        # fallback one-by-one
+        for item in data_list:
+            r2   = client._call("set", [{"url": url, "data": [item]}])
+            code = r2.get("result", [{}])[0].get("status", {}).get("code", -1)
+            if code != 0:
+                msg = r2.get("result", [{}])[0].get("status", {}).get("message", "")
+                failed.append({"name": name, "sub": sub_label,
+                               "code": code, "message": msg})
+                errors += 1
+
+    # IPsec: split action-list entries into separate push calls
+    if stype == "_ipsec":
+        action_entries = tmpl["subs"].get("action-list", [])
+        al_batch  = []  # tunnel basics for action-list URL
+        ph1_batch = []  # phase1 entries
+        ph2_batch = []  # phase2 entries
+
+        for entry in action_entries:
+            val = entry.get("value", {}) or {}
+
+            # Build action-list entry (tunnel basics + system interface only)
+            al_entry = {k: v for k, v in entry.items()
+                        if k not in _TMPL_STRIP | {"oid"}}
+            # Keep value but only with tunnel-level keys
+            al_val = {k: v for k, v in val.items()
+                      if k not in ("vpn ipsec phase1-interface",
+                                   "vpn ipsec phase2-interface")}
+            al_entry["value"] = al_val
+            al_batch.append(al_entry)
+
+            # Extract phase1 from nested value
+            ph1 = val.get("vpn ipsec phase1-interface")
+            if isinstance(ph1, dict):
+                clean_ph1 = {k: v for k, v in ph1.items() if k not in _TMPL_STRIP}
+                # Handle masked secrets — prompt user to enter PSK
+                for _, secret_field in _IPSEC_SECRET_PATHS:
+                    v = clean_ph1.get(secret_field)
+                    if isinstance(v, list) and v and v[0] == "ENC":
+                        tunnel_name = val.get("name", "?")
+                        print()
+                        print(yellow(f"  ⚠  '{tunnel_name}' — encrypted field: {secret_field}"))
+
+                        # Show field-specific guidance
+                        if secret_field == "psksecret":
+                            print(f"  {dim('Pre-shared key for IKE authentication. Required.')}")
+                            required = True
+                        elif secret_field == "ppk-secret":
+                            print(f"  {dim('IKEv2 Post-quantum Preshared Key (ASCII or hex with leading 0x).')}")
+                            print(f"  {dim('Not required — only enter if you use post-quantum protection.')}")
+                            required = False
+                        elif secret_field == "group-authentication-secret":
+                            print(f"  {dim('Password for IKEv2 ID group authentication (ASCII or hex with leading 0x).')}")
+                            print(f"  {dim('Not required — only enter if you use IKEv2 group authentication.')}")
+                            required = False
+                        else:
+                            print(f"  {dim('Encrypted credential — enter if applicable.')}")
+                            required = False
+
+                        label = f"  Enter {secret_field} for '{tunnel_name}'"
+                        label += " (required)" if required else " (or leave blank to skip)"
+                        psk = prompt_password(label)
+                        if psk:
+                            clean_ph1[secret_field] = psk
+                        else:
+                            clean_ph1.pop(secret_field, None)
+                            if required:
+                                print(yellow(f"  ⚠  Skipped — phase1 may fail without {secret_field}."))
+                            else:
+                                print(dim(f"  Skipped — set {secret_field} in FMG GUI if needed."))
+                ph1_batch.append(clean_ph1)
+
+            # Extract phase2 from nested value
+            ph2 = val.get("vpn ipsec phase2-interface")
+            if isinstance(ph2, dict):
+                clean_ph2 = {k: v for k, v in ph2.items() if k not in _TMPL_STRIP}
+                ph2_batch.append(clean_ph2)
+
+        base = f"/pm/config/adom/{adom}/template/_ipsec/{name}"
+        if al_batch:
+            _do_set(f"{base}/action-list/",              al_batch,  "action-list")
+        if ph1_batch:
+            _do_set(f"{base}/vpn/ipsec/phase1-interface/", ph1_batch, "phase1-interface")
+        if ph2_batch:
+            _do_set(f"{base}/vpn/ipsec/phase2-interface/", ph2_batch, "phase2-interface")
+
+    else:
+        # Non-IPsec templates: push each sub-object as-is
+        for sub in subs:
+            sub_name = sub["name"]
+            entries  = tmpl["subs"].get(sub_name, [])
+            if not entries:
+                continue
+            url   = f"/pm/config/adom/{adom}/template/{stype}/{name}/{sub['url']}"
+            batch = [{k: v for k, v in e.items() if k not in _TMPL_STRIP}
+                     for e in entries]
+            _do_set(url, batch, sub_name)
+
+    return errors, failed
+
+
+def _pick_templates(templates: list[dict], label: str) -> list[dict] | None:
+    """Numbered picker for templates. Returns selected list or None for back."""
+    if not templates:
+        print(dim("  No templates found."))
+        return []
+
+    col = max(len(t["name"]) for t in templates)
+    print()
+    for i, t in enumerate(templates, 1):
+        print(f"  {cyan(str(i).ljust(3))}  {t['name'].ljust(col)}")
+    print()
+    print(f"  Press {dim('Enter')} for all, or enter numbers e.g. {dim('1,3')}.")
+    print(f"  Type {dim('back')} to go back.")
+    print()
+
+    while True:
+        raw = input("  Selection > ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return None
+        if raw == "" or raw.lower() == "all":
+            return templates
+        selected = []
+        invalid  = []
+        seen     = set()
+        for token in (t.strip() for t in raw.split(",") if t.strip()):
+            if token.isdigit():
+                idx = int(token) - 1
+                if 0 <= idx < len(templates) and idx not in seen:
+                    seen.add(idx)
+                    selected.append(templates[idx])
+                else:
+                    invalid.append(token)
+            else:
+                invalid.append(token)
+        if invalid:
+            print(red(f"  Unknown: {', '.join(invalid)} — try again."))
+            continue
+        if not selected:
+            print(red("  Nothing selected — try again."))
+            continue
+        return selected
+
+
+def mode_template_export(client: FMGClient, adom_enabled: bool) -> None:
+    """Export IPsec and SD-WAN Overlay templates from an ADOM."""
+
+    # Pick ADOM
+    print()
+    print(bold("  " + "─" * 48))
+    adoms = select_adoms(client, None, adom_enabled)
+    if adoms is None:
+        return
+    if len(adoms) > 1:
+        print(yellow("  Template export works one ADOM at a time. Using first."))
+    adom = adoms[0]
+
+    output = {
+        "metadata": {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "fmg_version": client.get_sys_status()[0],
+            "source_adom": adom,
+        },
+        "ipsec_templates":        [],
+        "sdwan_overlay_templates": [],
+    }
+
+    # IPsec templates
+    print(f"  {dim('Fetching IPsec templates...')}", end=" ", flush=True)
+    ipsec_list = _get_templates(client, adom, "_ipsec")
+    print(green(f"{len(ipsec_list)} found") if ipsec_list else dim("none"))
+
+    if ipsec_list:
+        selected = _pick_templates(ipsec_list, "Select IPsec templates to export")
+        if selected is None:
+            return
+        for t in selected:
+            print(f"  Fetching {cyan(t['name'])} ...", end=" ", flush=True)
+            tmpl = _fetch_template(client, adom, "_ipsec", t["name"],
+                                   IPSEC_TEMPLATE_SUBS)
+            tmpl["meta"] = t
+            output["ipsec_templates"].append(tmpl)
+            total   = sum(len(v) for v in tmpl["subs"].values())
+            masked  = tmpl.get("masked_secrets", [])
+            suffix  = f"  {yellow(f'{len(masked)} secret(s) masked')}" if masked else ""
+            print(green(f"{total} sub-objects") + suffix)
+
+    # SD-WAN Overlay templates
+    print(f"  {dim('Fetching SD-WAN Overlay templates...')}", end=" ", flush=True)
+    sdwan_list = _get_templates(client, adom, "_sdwan_overlay")
+    print(green(f"{len(sdwan_list)} found") if sdwan_list else dim("none"))
+
+    if sdwan_list:
+        selected = _pick_templates(sdwan_list, "Select SD-WAN Overlay templates")
+        if selected is None:
+            return
+        for t in selected:
+            print(f"  Fetching {cyan(t['name'])} ...", end=" ", flush=True)
+            tmpl = _fetch_template(client, adom, "_sdwan_overlay", t["name"],
+                                   SDWAN_OVERLAY_SUBS)
+            tmpl["meta"] = t
+            output["sdwan_overlay_templates"].append(tmpl)
+            total = sum(len(v) for v in tmpl["subs"].values())
+            print(green(f"{total} sub-objects"))
+
+    # Save
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname     = f"fmg_templates_{timestamp}_{safe_adom}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, default=str)
+    size_kb = os.path.getsize(fname) / 1024
+    print(f"  {green(chr(10003))} Saved -> {bold(fname)}  ({size_kb:.0f} KB)\n")
+
+
+
+
+def mode_template_import(client: FMGClient, adom_enabled: bool) -> None:
+    """Import IPsec and SD-WAN Overlay templates from a JSON file."""
+
+    # Pick file
+    candidates = sorted(
+        f for f in os.listdir(".")
+        if f.startswith("fmg_templates") and f.endswith(".json")
+    )
+    if candidates:
+        print()
+        print("  Available template export files:\n")
+
+        for i, f in enumerate(candidates, 1):
+            size_kb = os.path.getsize(f) / 1024
+            print(f"    {cyan(str(i))}  {f}  {dim(f'({size_kb:.0f} KB)')}")
+        print()
+        raw = input("  Select file (number or path): ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return
+        fname = candidates[int(raw) - 1] if raw.isdigit() and 1 <= int(raw) <= len(candidates) else raw
+    else:
+        fname = input("  Path to template JSON file: ").strip()
+        if not fname:
+            return
+
+    if not os.path.isfile(fname):
+        print(red(f"  File not found: {fname}"))
+        return
+
+    print(f"  Loading {cyan(fname)} ...", end=" ", flush=True)
+    with open(fname, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    ipsec_tmpls = payload.get("ipsec_templates", [])
+    sdwan_tmpls = payload.get("sdwan_overlay_templates", [])
+    src_version = payload.get("metadata", {}).get("fmg_version", "")
+    src_adom    = payload.get("metadata", {}).get("source_adom", "")
+    print(green(f"OK  ({len(ipsec_tmpls)} IPsec, {len(sdwan_tmpls)} SD-WAN Overlay)"))
+    print(f"  Source ADOM : {cyan(display_name(src_adom))}")
+    if src_version:
+        print(f"  Source FMG  : {cyan(src_version)}")
+
+    # Pick target ADOM
+    print()
+    print(bold("  " + "─" * 48))
+    target_adom = _pick_target_adom(client, src_version, adom_enabled)
+    if target_adom is None:
+        return
+    _ensure_adom(client, target_adom)
+
+    total_errors = 0
+    all_failed   = []
+
+    # Import IPsec templates
+    if ipsec_tmpls:
+        print(f"Importing {bold(str(len(ipsec_tmpls)))} IPsec template(s)...")
+
+        for tmpl in ipsec_tmpls:
+            print(f"  {cyan(tmpl['name'])} ...", end=" ", flush=True)
+            errs, failed = _push_template(client, target_adom, tmpl,
+                                          IPSEC_TEMPLATE_SUBS)
+            total_errors += errs
+            all_failed.extend(failed)
+            print(green("OK") if errs == 0 else red(f"{errs} error(s)"))
+
+    # Import SD-WAN Overlay templates
+    if sdwan_tmpls:
+        print(f"Importing {bold(str(len(sdwan_tmpls)))} SD-WAN Overlay template(s)...")
+
+        for tmpl in sdwan_tmpls:
+            print(f"  {cyan(tmpl['name'])} ...", end=" ", flush=True)
+            errs, failed = _push_template(client, target_adom, tmpl,
+                                          SDWAN_OVERLAY_SUBS)
+            total_errors += errs
+            all_failed.extend(failed)
+            print(green("OK") if errs == 0 else red(f"{errs} error(s)"))
+
+    # Show errors
+    if all_failed:
+        print()
+        print(bold(f"  {red('✗')} Failed ({len(all_failed)}):"))
+        for f in all_failed:
+            print(f"    {red('✗')}  {f['name']}/{f['sub']}  {dim(f['message'])}")
+
+    print(green(f"\n  Done.  {total_errors} error(s)\n"))
+
+
+
+
 def pick_direction() -> str:
     """Top-level menu: Export or Import."""
     print()
@@ -2965,18 +3424,21 @@ def pick_data_type(direction: str) -> str:
     print()
     print(f"    {cyan('1')}  ADOM objects       {dim('(firewall addresses, services, users, etc.)')}")
     print(f"    {cyan('2')}  Policy packages    {dim('(firewall policies, DoS, NAT, etc.)')}")
+    print(f"    {cyan('3')}  Templates          {dim('(IPsec + SD-WAN Overlay templates)')}")
     print()
     print(f"  Type {dim('back')} to go back.")
     print()
     while True:
-        raw = input("  Select [1/2]: ").strip().lower()
+        raw = input("  Select [1/2/3]: ").strip().lower()
         if raw in ("back", "b", "q"):
             return "back"
         if raw in ("1", "objects", "o"):
             return "objects"
         if raw in ("2", "policy", "p", "policies"):
             return "policy"
-        print(red("  Please enter 1 or 2."))
+        if raw in ("3", "templates", "t"):
+            return "templates"
+        print(red("  Please enter 1, 2, or 3."))
 
 
 def main() -> None:
@@ -3077,8 +3539,11 @@ def main() -> None:
                                 if tables is None:
                                     break
 
-                    else:  # policy export
+                    elif data_type == "policy":
                         _policy_export(client, adom_enabled)
+
+                    else:  # templates
+                        mode_template_export(client, adom_enabled)
 
                 else:  # import
                     if data_type == "objects":
@@ -3091,8 +3556,11 @@ def main() -> None:
                             if again in ("n", "no", "q", "quit", "exit"):
                                 break
 
-                    else:  # policy import
+                    elif data_type == "policy":
                         _policy_import(client, adom_enabled)
+
+                    else:  # templates
+                        mode_template_import(client, adom_enabled)
 
                 print("  " + "─" * 48)
                 again = input(
