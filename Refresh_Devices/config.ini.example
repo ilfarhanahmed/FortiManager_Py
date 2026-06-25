@@ -1,0 +1,19 @@
+[fortimanager]
+# FortiManager IP address, hostname, base URL, or complete JSON-RPC URL.
+host = 10.128.210.118
+
+# REST API administrator key.
+api_key = PASTE_API_KEY_HERE
+
+# Set to false when FortiManager uses a self-signed certificate.
+# Set to true when the certificate is trusted by the local system.
+verify_ssl = false
+
+# HTTP timeout in seconds.
+timeout = 30
+
+# Delay between task checks in seconds.
+poll_interval = 2
+
+# Maximum number of task checks.
+max_polls = 150
