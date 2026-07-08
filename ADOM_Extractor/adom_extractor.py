@@ -26,6 +26,205 @@ import urllib.error
 import ssl
 from datetime import datetime, timezone
 
+# ── File encryption ────────────────────────────────────────────────────────────
+#
+# Encrypted files use this format:
+#   Magic header (8 bytes)  : b"FMGENC1\x00"
+#   Salt       (16 bytes)   : random, for PBKDF2
+#   Nonce      (12 bytes)   : random, for AES-256-GCM
+#   Ciphertext + GCM tag    : AES-256-GCM encrypted JSON bytes
+#
+# Key derivation: PBKDF2-HMAC-SHA256, 600,000 iterations, 32-byte key.
+# The GCM tag (16 bytes) is appended by the AESGCM encrypt call automatically.
+
+_ENC_MAGIC      = b"FMGENC1\x00"
+_ENC_SALT_LEN   = 16
+_ENC_NONCE_LEN  = 12
+_PBKDF2_ITERS   = 600_000
+_PBKDF2_DKLEN   = 32  # AES-256
+_FORCE_EXPORT_ENCRYPTION = False
+
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    """Derive a 256-bit key from a password using PBKDF2-HMAC-SHA256."""
+    import hashlib
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        _PBKDF2_ITERS,
+        dklen=_PBKDF2_DKLEN,
+    )
+
+
+def encrypt_bytes(plaintext: bytes, password: str) -> bytes:
+    """
+    Encrypt raw bytes with AES-256-GCM.
+    Returns the binary blob ready to write to disk.
+    """
+    import os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    salt       = os.urandom(_ENC_SALT_LEN)
+    nonce      = os.urandom(_ENC_NONCE_LEN)
+    key        = _derive_key(password, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)  # includes GCM tag
+
+    return _ENC_MAGIC + salt + nonce + ciphertext
+
+
+def encrypt_json(data: dict, password: str) -> bytes:
+    """
+    Serialise data as JSON, then encrypt with AES-256-GCM.
+    Returns the binary blob ready to write to disk.
+    """
+    plaintext = json.dumps(data, indent=2, default=str).encode("utf-8")
+    return encrypt_bytes(plaintext, password)
+
+
+def decrypt_json(blob: bytes, password: str) -> dict:
+    """
+    Decrypt a blob produced by encrypt_json() and return the parsed dict.
+    Raises ValueError on wrong password or corrupted file.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+
+    if not blob.startswith(_ENC_MAGIC):
+        raise ValueError("Not an encrypted FMG export file (bad magic header).")
+
+    offset     = len(_ENC_MAGIC)
+    salt       = blob[offset : offset + _ENC_SALT_LEN]
+    offset    += _ENC_SALT_LEN
+    nonce      = blob[offset : offset + _ENC_NONCE_LEN]
+    offset    += _ENC_NONCE_LEN
+    ciphertext = blob[offset:]
+
+    key    = _derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    try:
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    except InvalidTag:
+        raise ValueError("Decryption failed — wrong password or file corrupted.")
+
+    return json.loads(plaintext.decode("utf-8"))
+
+
+def _prompt_encryption_password(confirm: bool = True, force: bool | None = None) -> str | None:
+    """
+    Ask whether to encrypt the export and prompt for a password.
+
+    If force=True (for example with --encrypt), encryption is mandatory and the
+    yes/no question is skipped. Returns None only when encryption is optional
+    and the user opts out.
+    """
+    if force is None:
+        force = _FORCE_EXPORT_ENCRYPTION
+
+    if not force:
+        print()
+        choice = input(f"  Encrypt export file? [{green('Y')}/n]: ").strip().lower()
+        if choice in ("n", "no"):
+            return None
+    else:
+        print()
+        print(f"  {cyan('🔒')} Encryption enabled for this export.")
+
+    while True:
+        pw = prompt_password("  Encryption password")
+        if not pw:
+            print(red("  Password cannot be empty."))
+            continue
+        if confirm:
+            pw2 = prompt_password("  Confirm password")
+            if pw != pw2:
+                print(red("  Passwords do not match — try again."))
+                continue
+        return pw
+
+
+def _encrypted_path(path: str) -> str:
+    """Return the encrypted output path for a requested plaintext path."""
+    if path.lower().endswith(".fmgenc"):
+        return path
+    if path.lower().endswith(".json"):
+        return path[:-5] + ".fmgenc"
+    return path + ".fmgenc"
+
+
+def _save_file(path: str, data: dict, password: str | None,
+               label: str = "export") -> str:
+    """
+    Write JSON data to path as either an encrypted .fmgenc file or a plain .json file.
+    Returns the actual file path written.
+    """
+    if password:
+        enc_path = _encrypted_path(path)
+        blob = encrypt_json(data, password)
+        with open(enc_path, "wb") as f:
+            f.write(blob)
+        size_kb = os.path.getsize(enc_path) / 1024
+        print(f"  {green(chr(10003))} Saved (encrypted) → {bold(enc_path)}  ({size_kb:.0f} KB)")
+        print(f"  {dim('     AES-256-GCM encrypted. Keep the password safe — it cannot be recovered.')}")
+        return enc_path
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+    size_kb = os.path.getsize(path) / 1024
+    print(f"  {green(chr(10003))} Saved → {bold(path)}  ({size_kb:.0f} KB)")
+    print(f"  {yellow('⚠')}  {dim(f'Unencrypted {label} — may contain secrets. Restrict access and delete after use.')}")
+    return path
+
+
+def _save_bytes_file(path: str, content: bytes, password: str | None,
+                     label: str = "export") -> str:
+    """
+    Write arbitrary bytes to disk. If password is provided, encrypt the bytes
+    and write .fmgenc output. Used for CSV exports.
+    """
+    if password:
+        enc_path = _encrypted_path(path)
+        blob = encrypt_bytes(content, password)
+        with open(enc_path, "wb") as f:
+            f.write(blob)
+        size_kb = os.path.getsize(enc_path) / 1024
+        print(f"  {green(chr(10003))} Saved (encrypted) → {bold(enc_path)}  ({size_kb:.0f} KB)")
+        print(f"  {dim('     AES-256-GCM encrypted CSV. Keep the password safe — it cannot be recovered.')}")
+        return enc_path
+
+    with open(path, "wb") as f:
+        f.write(content)
+    size_kb = os.path.getsize(path) / 1024
+    print(f"  {green(chr(10003))} Saved → {bold(path)}  ({size_kb:.0f} KB)")
+    print(f"  {yellow('⚠')}  {dim(f'Unencrypted {label} — may contain secrets. Restrict access and delete after use.')}")
+    return path
+
+
+def _load_file(path: str) -> dict:
+    """
+    Load a file that is either a plain JSON or encrypted .fmgenc file.
+    Prompts for password if encrypted.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    if raw.startswith(_ENC_MAGIC):
+        print(f"  {cyan('🔒')} File is encrypted.")
+        while True:
+            pw = prompt_password("  Decryption password")
+            try:
+                return decrypt_json(raw, pw)
+            except ValueError as e:
+                print(red(f"  ✗ {e}"))
+                retry = input("  Try again? [Y/n]: ").strip().lower()
+                if retry in ("n", "no"):
+                    raise SystemExit(1)
+    else:
+        return json.loads(raw.decode("utf-8"))
+
+
+
+
 # Terminal colour helpers — disabled automatically on Windows or non-TTY output
 USE_COLOUR = sys.stdout.isatty() and os.name != "nt"
 
@@ -752,8 +951,11 @@ class FMGClient:
         self._req_id = 1
         self._ssl_ctx = ssl.create_default_context()
         if not verify_ssl:
+            # TLS certificate verification disabled — acceptable for self-signed
+            # FMG certs on a trusted management network. Use --verify-ssl on
+            # untrusted networks to prevent man-in-the-middle attacks.
             self._ssl_ctx.check_hostname = False
-            self._ssl_ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_ctx.verify_mode    = ssl.CERT_NONE
 
     # HTTP transport
 
@@ -1081,9 +1283,12 @@ def _sanitize_filename(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
-def write_json_per_adom(data: dict, out_stem: str, no_csv: bool) -> None:
+def write_json_per_adom(data: dict, out_stem: str, no_csv: bool,
+                        enc_password: str | None = None) -> None:
     """Write one JSON (and optionally one CSV) file per ADOM."""
     import csv
+    import io
+
     for adom, tables in data["data"].items():
         safe = _sanitize_filename(display_name(adom))
 
@@ -1097,17 +1302,16 @@ def write_json_per_adom(data: dict, out_stem: str, no_csv: bool) -> None:
             "data": {adom: tables},
         }
 
-        # JSON
+        # JSON or encrypted JSON
         json_path = f"{out_stem}_{safe}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(adom_payload, f, indent=2, default=str)
-        size_kb = os.path.getsize(json_path) / 1024
-        print(f"  {green('✓')} JSON  → {bold(json_path)}  ({size_kb:.0f} KB)")
+        _save_file(json_path, adom_payload, enc_password, "ADOM objects export")
 
-        # CSV
+        # CSV or encrypted CSV
         if not no_csv:
             rows = []
             for table_name, entries in tables.items():
+                if not isinstance(entries, list):
+                    continue
                 for entry in entries:
                     rows.append({
                         "adom": adom,
@@ -1115,14 +1319,20 @@ def write_json_per_adom(data: dict, out_stem: str, no_csv: bool) -> None:
                         "name": entry.get("name", entry.get("id", "")),
                         "data": json.dumps(entry, default=str),
                     })
+
+            csv_buffer = io.StringIO()
+            writer = csv.DictWriter(csv_buffer, fieldnames=["adom", "table", "name", "data"])
+            writer.writeheader()
+            writer.writerows(rows)
+
             csv_path = f"{out_stem}_{safe}.csv"
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=["adom", "table", "name", "data"])
-                writer.writeheader()
-                writer.writerows(rows)
-            size_kb = os.path.getsize(csv_path) / 1024
-            print(f"  {green('✓')} CSV   → {bold(csv_path)}  ({size_kb:.0f} KB)  "
-                  f"({len(rows)} rows)")
+            actual_csv_path = _save_bytes_file(
+                csv_path,
+                csv_buffer.getvalue().encode("utf-8"),
+                enc_password,
+                "ADOM objects CSV export",
+            )
+            print(f"  {dim(f'     CSV rows: {len(rows)}')}")
 
 
 def write_summary(data: dict) -> None:
@@ -1553,11 +1763,12 @@ Examples:
     p.add_argument("--host",     help="FortiManager IP or hostname")
     p.add_argument("--port",     type=int, default=443, help="HTTPS port (default: 443)")
     p.add_argument("--user",     help="API username")
-    p.add_argument("--password", help="Password (omit to prompt securely)")
+    p.add_argument("--password", help="Password — avoid on shared systems (visible in process list). Omit to prompt securely.")
     p.add_argument("--adom",     help="Extract only this ADOM (default: all)")
     p.add_argument("--category", help="Extract only this category (e.g. firewall, wireless-controller). Covers both ADOM and Controller tables.")
     p.add_argument("--out",      default="", help="Output JSON filename (default: auto-generated)")
     p.add_argument("--no-csv",   action="store_true", help="Skip CSV export")
+    p.add_argument("--encrypt",  action="store_true", help="Force encrypted exports (.fmgenc) without asking yes/no")
     p.add_argument("--no-summary", action="store_true", help="Skip count summary")
     p.add_argument("--verify-ssl", action="store_true", help="Verify TLS certificate")
     p.add_argument("--list-categories", action="store_true",
@@ -1578,10 +1789,18 @@ def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
 
     # Save one file per ADOM
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_stem = args.out.rstrip(".json") if args.out else f"fmg_adom_objects_{timestamp}"
+    if args.out:
+        out_stem = args.out
+        for suffix in (".json", ".fmgenc"):
+            if out_stem.lower().endswith(suffix):
+                out_stem = out_stem[:-len(suffix)]
+                break
+    else:
+        out_stem = f"fmg_adom_objects_{timestamp}"
 
     print(f"\n  {bold('Saving output...')}")
-    write_json_per_adom(result, out_stem, no_csv=args.no_csv)
+    enc_pw = _prompt_encryption_password(confirm=True, force=args.encrypt)
+    write_json_per_adom(result, out_stem, no_csv=args.no_csv, enc_password=enc_pw)
 
     if not args.no_summary:
         write_summary(result)
@@ -1674,7 +1893,9 @@ def _pick_restore_file() -> str:
     """List available extractor JSON files and let the user pick one."""
     candidates = sorted(
         f for f in os.listdir(".")
-        if f.startswith("fmg_adom_objects") and f.endswith(".json")
+        if f.startswith("fmg_adom_objects")
+        and (f.endswith(".json") or f.endswith(".fmgenc"))
+        and not f.endswith(".csv.fmgenc")
     )
     if candidates:
         print()
@@ -2130,9 +2351,10 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
 
     print(f"\n  Loading {cyan(json_file)} ...", end=" ", flush=True)
     try:
-        with open(json_file, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        payload = _load_file(json_file)
+    except SystemExit:
+        return
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
         print(red(f"\n  ✗ {exc}"))
         return
 
@@ -2571,12 +2793,9 @@ def _policy_export(client: FMGClient, adom_enabled: bool) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_adom = _sanitize_filename(display_name(adom))
     fname     = f"fmg_policy_{timestamp}_{safe_adom}.json"
-
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, default=str)
-
-    size_kb = os.path.getsize(fname) / 1024
-    print(f"  {green('✓')} Saved → {bold(fname)}  ({size_kb:.0f} KB)")
+    enc_pw = _prompt_encryption_password(confirm=True)
+    _save_file(fname, output, enc_pw, "policy export")
+    print()
 
 
 def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
@@ -2599,7 +2818,8 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
     # Pick file
     candidates = sorted(
         f for f in os.listdir(".")
-        if f.startswith("fmg_policy") and f.endswith(".json")
+        if f.startswith("fmg_policy")
+        and (f.endswith(".json") or f.endswith(".fmgenc"))
     )
     if candidates:
         print()
@@ -2624,9 +2844,10 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
         print(red(f"  File not found: {fname}"))
         return
 
-    print(f"  Loading {cyan(fname)} ...", end=" ", flush=True)
-    with open(fname, encoding="utf-8") as f:
-        payload = json.load(f)
+    try:
+        payload = _load_file(fname)
+    except (ValueError, SystemExit):
+        return
 
     file_data = payload.get("data", {})
     meta      = payload.get("metadata", {})
@@ -3302,10 +3523,9 @@ def mode_template_export(client: FMGClient, adom_enabled: bool) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_adom = _sanitize_filename(display_name(adom))
     fname     = f"fmg_templates_{timestamp}_{safe_adom}.json"
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, default=str)
-    size_kb = os.path.getsize(fname) / 1024
-    print(f"  {green(chr(10003))} Saved -> {bold(fname)}  ({size_kb:.0f} KB)\n")
+    enc_pw    = _prompt_encryption_password(confirm=True)
+    _save_file(fname, output, enc_pw, "template export")
+    print()
 
 
 
@@ -3316,7 +3536,8 @@ def mode_template_import(client: FMGClient, adom_enabled: bool) -> None:
     # Pick file
     candidates = sorted(
         f for f in os.listdir(".")
-        if f.startswith("fmg_templates") and f.endswith(".json")
+        if f.startswith("fmg_templates")
+        and (f.endswith(".json") or f.endswith(".fmgenc"))
     )
     if candidates:
         print()
@@ -3339,9 +3560,10 @@ def mode_template_import(client: FMGClient, adom_enabled: bool) -> None:
         print(red(f"  File not found: {fname}"))
         return
 
-    print(f"  Loading {cyan(fname)} ...", end=" ", flush=True)
-    with open(fname, encoding="utf-8") as f:
-        payload = json.load(f)
+    try:
+        payload = _load_file(fname)
+    except (ValueError, SystemExit):
+        return
 
     ipsec_tmpls = payload.get("ipsec_templates", [])
     sdwan_tmpls = payload.get("sdwan_overlay_templates", [])
@@ -3442,7 +3664,9 @@ def pick_data_type(direction: str) -> str:
 
 
 def main() -> None:
+    global _FORCE_EXPORT_ENCRYPTION
     args = parse_args()
+    _FORCE_EXPORT_ENCRYPTION = bool(args.encrypt)
 
     if args.list_categories:
         print("\nADOM Object categories:\n")
