@@ -1,10 +1,11 @@
-#!/usr/bin/env python3
 """
 FortiManager ADOM Object Extractor & Restorer
 
 Connects to a FortiManager via JSON-RPC API and lets you:
   - Extract all ADOM-level objects to JSON/CSV files
   - Restore objects from a previously extracted file into any target ADOM
+  - Export/import policy packages, templates, and CLI scripts
+  - Move device/VDOM members between ADOMs and trigger config retrieve tasks
 
 Supports FMG 7.6.6, 288 object types (ADOM + Controller Config).
 
@@ -1283,6 +1284,52 @@ def _sanitize_filename(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
+def _format_adom_version(ver: str) -> str:
+    """Return a user-friendly ADOM version label such as v8.0."""
+    ver = str(ver or "").strip()
+    if not ver:
+        return ""
+    return ver if ver.lower().startswith("v") else f"v{ver}"
+
+
+def _get_adom_version_map(client: FMGClient) -> dict:
+    """Return {adom_name: adom_version}. Empty if ADOM list is unavailable."""
+    try:
+        return {a.get("name"): a.get("version", "") for a in client.get_adoms() if a.get("name")}
+    except Exception:
+        return {}
+
+
+def _get_source_adom_version(client: FMGClient, adom: str) -> str:
+    """Return the FortiManager ADOM version for an export source ADOM."""
+    return _get_adom_version_map(client).get(adom, "")
+
+
+def _source_adom_version_from_metadata(meta: dict, source_adom: str = "") -> str:
+    """Read ADOM version from export metadata, supporting older/newer metadata keys."""
+    if not isinstance(meta, dict):
+        return ""
+    version = (meta.get("source_adom_version")
+               or meta.get("adom_version")
+               or "")
+    if version:
+        return str(version)
+
+    versions = meta.get("source_adom_versions") or meta.get("adom_versions") or {}
+    if isinstance(versions, dict) and source_adom:
+        return str(versions.get(source_adom, ""))
+    return ""
+
+
+def _add_source_adom_versions(client: FMGClient, output: dict, adoms: list[str]) -> None:
+    """Add source ADOM version metadata to an export payload."""
+    versions = _get_adom_version_map(client)
+    selected = {a: versions.get(a, "") for a in adoms}
+    output.setdefault("metadata", {})["source_adom_versions"] = selected
+    if len(adoms) == 1:
+        output["metadata"]["source_adom_version"] = selected.get(adoms[0], "")
+
+
 def write_json_per_adom(data: dict, out_stem: str, no_csv: bool,
                         enc_password: str | None = None) -> None:
     """Write one JSON (and optionally one CSV) file per ADOM."""
@@ -1297,6 +1344,8 @@ def write_json_per_adom(data: dict, out_stem: str, no_csv: bool,
             "metadata": {
                 **{k: v for k, v in data["metadata"].items() if k != "adoms"},
                 "adom": adom,
+                "source_adom": adom,
+                "source_adom_version": (data.get("metadata", {}).get("source_adom_versions", {}) or {}).get(adom, ""),
                 "fmg_version": data.get("metadata", {}).get("fmg_version", ""),
             },
             "data": {adom: tables},
@@ -1600,25 +1649,103 @@ def _show_table_list(cat: str) -> list[dict]:
     return tables
 
 
-def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] | None:
+def select_tables_interactive(_unused: list[dict] | None = None,
+                              mode: str = "export",
+                              available_table_names: set[str] | None = None) -> list[dict] | None:
     """
-    Multi-step interactive table picker:
-      Step 1 — All objects  OR  Selective
-      Step 2 — Category list  (if selective)
-      Step 3 — All tables in category  OR  pick specific table(s) / range
-    At every step typing 'back' goes up one level; 'back' at step 1 returns None.
+    Multi-step table picker used by both export and import.
+
+    Export mode:
+      - Shows "Export scope"
+      - "All" means every supported FMG table.
+
+    Import mode:
+      - Shows "Import scope"
+      - "All" means every table actually present in the selected backup file.
     """
-    adom_cats = sorted(set(t["name"].split("/")[0] for t in ADOM_TABLES))
-    ctrl_cats = sorted(set(t["name"].split("/")[0] for t in CONTROLLER_TABLES))
-    all_cats  = adom_cats + ctrl_cats
+    is_import = mode.lower() in ("import", "restore")
+    action = "Import" if is_import else "Export"
+    action_lower = action.lower()
+
+    # In import mode, restrict choices to tables that exist in the backup file.
+    if available_table_names is not None:
+        available_set = set(available_table_names)
+        selectable_tables = [t for t in ALL_TABLES if t["name"] in available_set]
+    else:
+        selectable_tables = list(ALL_TABLES)
+
+    if not selectable_tables:
+        print(red(f"  No supported tables found for {action_lower}."))
+        return None
+
+    def _ordered_categories(tables: list[dict]) -> list[str]:
+        seen = set()
+        ordered = []
+        for t in tables:
+            cat = t["name"].split("/")[0]
+            if cat not in seen:
+                seen.add(cat)
+                ordered.append(cat)
+        return ordered
+
+    def _print_categories_for_scope() -> list[str]:
+        """Print categories that have tables in the current export/import scope."""
+        adom_tables = [t for t in ADOM_TABLES if t in selectable_tables]
+        ctrl_tables = [t for t in CONTROLLER_TABLES if t in selectable_tables]
+
+        all_cats: list[str] = []
+        col_idx = 1
+        all_cat_names = _ordered_categories(adom_tables) + _ordered_categories(ctrl_tables)
+        if all_cat_names:
+            col_idx = len(str(len(all_cat_names)))
+        col_name = max([len(c) for c in all_cat_names] + [len("Category")])
+        sep = "  "
+
+        if adom_tables:
+            _print_divider("ADOM Objects")
+            for cat in _ordered_categories(adom_tables):
+                all_cats.append(cat)
+                count = sum(1 for t in adom_tables if t["name"].split("/")[0] == cat)
+                print(f"  {cyan(str(len(all_cats)).ljust(col_idx))}{sep}{cat.ljust(col_name)}{sep}"
+                      f"{dim(str(count) + (' table' if count == 1 else ' tables'))}")
+
+        if ctrl_tables:
+            print()
+            _print_divider("Controller Config")
+            for cat in _ordered_categories(ctrl_tables):
+                all_cats.append(cat)
+                count = sum(1 for t in ctrl_tables if t["name"].split("/")[0] == cat)
+                print(f"  {cyan(str(len(all_cats)).ljust(col_idx))}{sep}{cat.ljust(col_name)}{sep}"
+                      f"{dim(str(count) + (' table' if count == 1 else ' tables'))}")
+
+        return all_cats
+
+    def _show_tables_for_category(cat: str) -> list[dict]:
+        tables = [t for t in selectable_tables if t["name"].split("/")[0] == cat]
+        col_idx = len(str(len(tables)))
+        col_name = max(len(t["name"]) for t in tables)
+        print()
+        _print_divider(f"{cat}  ({len(tables)} tables)")
+        for i, t in enumerate(tables, 1):
+            desc = dim("  " + t.get("description", "")[:55]) if t.get("description") else ""
+            print(f"  {cyan(str(i).ljust(col_idx))}  {t['name'].ljust(col_name)}{desc}")
+        print()
+        return tables
 
     # ── Step 1: All or Selective ───────────────────────────────────────────────
     while True:
+        cat_count = len(set(t["name"].split("/")[0] for t in selectable_tables))
+        total_tables = len(selectable_tables)
+
         print()
-        print(bold("  Export scope"))
+        print(bold(f"  {action} scope"))
         print()
-        print(f"  {cyan('1')}  All objects      {dim(str(len(ALL_TABLES)) + ' tables across ' + str(len(all_cats)) + ' categories')}")
-        print(f"  {cyan('2')}  Selective export {dim('choose category then tables')}")
+        if is_import:
+            print(f"  {cyan('1')}  All objects in file   {dim(str(total_tables) + ' table(s) with data across ' + str(cat_count) + ' categories')}")
+            print(f"  {cyan('2')}  Selective import    {dim('choose category then tables from this backup file')}")
+        else:
+            print(f"  {cyan('1')}  All objects          {dim(str(total_tables) + ' tables across ' + str(cat_count) + ' categories')}")
+            print(f"  {cyan('2')}  Selective export    {dim('choose category then tables')}")
         print()
         print(f"  Type {dim('back')} to return to the main menu.")
         print()
@@ -1628,8 +1755,11 @@ def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] |
             return None
 
         if raw in ("1", "all"):
-            print(f"  Scope: {cyan('all')}  ({len(ALL_TABLES)} tables)")
-            return ALL_TABLES
+            if is_import:
+                print(f"  Scope: {cyan('all objects in file')}  ({total_tables} table(s))")
+            else:
+                print(f"  Scope: {cyan('all')}  ({total_tables} tables)")
+            return selectable_tables
 
         if raw in ("2", "selective", "s"):
             break   # proceed to category picker
@@ -1639,9 +1769,9 @@ def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] |
     # ── Step 2: Category picker ────────────────────────────────────────────────
     while True:
         print()
-        print(bold("  Select category"))
+        print(bold(f"  Select category to {action_lower}"))
         print()
-        all_cats = _show_category_list()  # returns the full list
+        all_cats = _print_categories_for_scope()
         print()
         print(f"  Enter a {dim('number')} to pick a category.")
         print(f"  Type {dim('back')} to go back.")
@@ -1664,65 +1794,74 @@ def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] |
         elif raw in all_cats:
             cat = raw
         else:
-            print(red(f"  Unknown category '{raw}' — try again."))
-            continue
+            # Case-insensitive category name
+            matches = [c for c in all_cats if c.lower() == raw.lower()]
+            if matches:
+                cat = matches[0]
+            else:
+                print(red("  Invalid category — try again."))
+                continue
 
-        # ── Step 3: Table picker within category ──────────────────────────────
+        # ── Step 3: Table picker inside the chosen category ───────────────────
+        cat_tables = _show_tables_for_category(cat)
         while True:
-            cat_tables = _show_table_list(cat)
-            n = len(cat_tables)
-
-            print(f"  {cyan('0')}  All {n} tables in {bold(cat)}")
+            print(f"  {cyan('1')}  All tables in {cat}")
+            print(f"  {cyan('2')}  Specific table(s)  {dim('comma list or ranges, e.g. 1,3-5')}")
+            print(f"  Type {dim('back')} to choose another category.")
             print()
-            print(f"  Enter {dim('0')} for all, a {dim('number')}, or a {dim('range')} like {dim('1-5')}.")
-            print(f"  You can also combine: {dim('1,3,5-8')}")
-            print(f"  Type {dim('back')} to go back to categories.")
-            print()
-
             raw2 = input("  Selection > ").strip()
 
             if raw2.lower() in ("back", "b", "q"):
-                break   # back to category picker
+                break  # back to category list
 
-            if raw2 == "0" or raw2.lower() == "all" or raw2 == "":
-                print(f"  Scope: {cyan(cat)}  (all {n} tables)")
+            if raw2.lower() in ("1", "all"):
+                print(f"  Scope: {cyan(cat + '/*')}  ({len(cat_tables)} table(s))")
                 return cat_tables
 
-            # Parse numbers and ranges e.g. "1,3,5-8"
-            selected: list[dict] = []
-            invalid:  list[str]  = []
-            seen_idx: set        = set()
+            # Accept direct comma/range input as shorthand for specific tables
+            if raw2.lower() in ("2", "specific", "s"):
+                table_raw = input("  Table number(s) / name(s) > ").strip()
+            else:
+                table_raw = raw2
 
-            for token in (t.strip() for t in raw2.split(",") if t.strip()):
-                # Range e.g. "2-5"
-                if "-" in token:
-                    parts = token.split("-", 1)
-                    if parts[0].isdigit() and parts[1].isdigit():
-                        lo, hi = int(parts[0]) - 1, int(parts[1]) - 1
-                        if 0 <= lo <= hi < n:
-                            for idx in range(lo, hi + 1):
-                                if idx not in seen_idx:
-                                    seen_idx.add(idx)
-                                    selected.append(cat_tables[idx])
-                        else:
-                            invalid.append(token)
-                    else:
+            if table_raw.lower() in ("back", "b", "q"):
+                break
+
+            selected: list[dict] = []
+            invalid: list[str] = []
+            seen_names: set[str] = set()
+            n = len(cat_tables)
+
+            for token in [x.strip() for x in table_raw.split(",") if x.strip()]:
+                # Range: 2-5
+                if "-" in token and all(part.strip().isdigit() for part in token.split("-", 1)):
+                    a, b = [int(x.strip()) for x in token.split("-", 1)]
+                    if a > b:
+                        a, b = b, a
+                    if a < 1 or b > n:
                         invalid.append(token)
+                        continue
+                    for idx in range(a - 1, b):
+                        table_name = cat_tables[idx]["name"]
+                        if table_name not in seen_names:
+                            seen_names.add(table_name)
+                            selected.append(cat_tables[idx])
                 elif token.isdigit():
                     idx = int(token) - 1
                     if 0 <= idx < n:
-                        if idx not in seen_idx:
-                            seen_idx.add(idx)
+                        table_name = cat_tables[idx]["name"]
+                        if table_name not in seen_names:
+                            seen_names.add(table_name)
                             selected.append(cat_tables[idx])
                     else:
                         invalid.append(token)
                 else:
-                    # Try exact table name
-                    match = [t for t in cat_tables if t["name"] == token]
+                    match = [t for t in cat_tables if t["name"] == token or t["name"].lower() == token.lower()]
                     if match:
                         for t in match:
-                            if id(t) not in seen_idx:
-                                seen_idx.add(id(t))
+                            table_name = t["name"]
+                            if table_name not in seen_names:
+                                seen_names.add(table_name)
                                 selected.append(t)
                     else:
                         invalid.append(token)
@@ -1739,25 +1878,25 @@ def select_tables_interactive(_unused: list[dict] | None = None) -> list[dict] |
             return selected
 
     # User went back from category step — loop back to step 1
-    return select_tables_interactive()
-
+    return select_tables_interactive(mode=mode, available_table_names=available_table_names)
 
 # Entry point
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Extract all ADOM-level objects from FortiManager via JSON-RPC API.",
+        description="FortiManager migration helper: export/import ADOM objects, policies, templates, scripts, and device operations.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Categories available:
   {', '.join(CATEGORIES)}
 
 Examples:
-  python3 fmg_adom_extractor.py
-  python3 fmg_adom_extractor.py --host 10.0.0.1 --user admin
-  python3 fmg_adom_extractor.py --adom root --category firewall
-  python3 fmg_adom_extractor.py --out /tmp/backup.json --no-csv
-  python3 fmg_adom_extractor.py --list-categories
+  py .\fmg_migration_tool_full.py
+  py .\fmg_migration_tool_full.py --host 10.0.0.1 --user admin
+  py .\fmg_migration_tool_full.py --adom root --category firewall
+  py .\fmg_migration_tool_full.py --out backup.json --no-csv
+  py .\fmg_migration_tool_full.py --encrypt
+  py .\fmg_migration_tool_full.py --list-categories
         """
     )
     p.add_argument("--host",     help="FortiManager IP or hostname")
@@ -1786,6 +1925,7 @@ def run_once(client: FMGClient, adoms: list[str], tables: list[dict],
     # Run extraction
     fmg_version, _ = client.get_sys_status()
     result = run_extraction(client, adoms, tables, fmg_version)
+    _add_source_adom_versions(client, result, adoms)
 
     # Save one file per ADOM
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1940,7 +2080,7 @@ def _pick_source_adom_from_file(file_data: dict) -> str:
         print(red("  Invalid selection — try again."))
 
 
-def _pick_target_adom(client: FMGClient, source_version: str = "",
+def _pick_target_adom(client: FMGClient, source_adom_version: str = "",
                       adom_enabled: bool = True) -> str:
     """Numbered ADOM picker for restore target; allows typing a new ADOM name."""
     if adom_enabled:
@@ -1971,13 +2111,10 @@ def _pick_target_adom(client: FMGClient, source_version: str = "",
     divider  = "─" * (col_idx + len(sep) + col_name + len(sep) + col_note)
 
     print()
-    if source_version:
-        import re as _re
-        m     = _re.search(r'v(\d+\.\d+)', source_version)
-        short = f"v{m.group(1)}" if m else source_version.split('-')[0]
-        print(f"  {yellow('ℹ')}  Export was from FortiManager {cyan(short)}.")
-        print(f"  {dim('Recommended: restore to a ' + short + ' ADOM.')}")
-        print(f"  {dim('Other versions may work but could have schema compatibility issues.')}")
+    if source_adom_version:
+        print(f"  {yellow('ℹ')}  Exported ADOM version: {cyan(_format_adom_version(source_adom_version))}.")
+        print(f"  {dim('Recommended: import to the same FortiManager version and the same ADOM version.')}")
+        print(f"  {dim('Different FMG/ADOM versions may work, but schema compatibility issues are possible.')}")
         print()
     print(f"  Select target ADOM  {dim('(or type a new name to create it)')}")
     print(f"  {'#':<{col_idx}}{sep}{'ADOM Name':<{col_name}}{sep}Note")
@@ -2372,8 +2509,9 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
     adom_data   = file_data[source_adom]
 
     # Pick target ADOM on the connected FMG
-    source_version = payload.get("metadata", {}).get("fmg_version", "")
-    target_adom    = _pick_target_adom(client, source_version, adom_enabled)
+    meta = payload.get("metadata", {})
+    source_adom_version = _source_adom_version_from_metadata(meta, source_adom)
+    target_adom    = _pick_target_adom(client, source_adom_version, adom_enabled)
     if target_adom is None:
         return  # user went back
     _ensure_adom(client, target_adom)
@@ -2388,7 +2526,7 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
         print(bold("  " + "─" * 48))
 
         if step == 1:
-            tables_selected = select_tables_interactive()
+            tables_selected = select_tables_interactive(mode="import", available_table_names=set(adom_data.keys()))
             if tables_selected is None:
                 return  # back from table scope → exit restore entirely
             step = 2
@@ -2423,7 +2561,7 @@ def mode_restore(client: FMGClient, adom_enabled: bool = True,
                 tables_to_push = _pick_objects(adom_data, tables_selected)
                 if tables_to_push is None:
                     step = 1
-                    tables_selected = select_tables_interactive()
+                    tables_selected = select_tables_interactive(mode="import", available_table_names=set(adom_data.keys()))
                     if tables_selected is None:
                         return
                     step = 2
@@ -2755,6 +2893,7 @@ def _policy_export(client: FMGClient, adom_enabled: bool) -> None:
             "exported_at":  datetime.now(timezone.utc).isoformat(),
             "fmg_version":  client.get_sys_status()[0],
             "source_adom":  adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
             "packages":     [p["path"] for p in packages],
             "policy_types": [t["name"] for t in tables],
             "pblocks":      [p["name"] for p in pblocks],
@@ -2859,16 +2998,17 @@ def _policy_import(client: FMGClient, adom_enabled: bool) -> None:
                     for v in pkg.values() if isinstance(v, list))
     print(green(f"OK  ({len(file_data)} package(s), {total_pol} policies)"))
 
-    src_version = meta.get("fmg_version", "")
     src_adom    = meta.get("source_adom", "")
-    print(f"  Source ADOM : {cyan(display_name(src_adom))}")
-    if src_version:
-        print(f"  Source FMG  : {cyan(src_version)}")
+    src_adom_version = _source_adom_version_from_metadata(meta, src_adom)
+    print(f"  Source ADOM         : {cyan(display_name(src_adom))}")
+    if src_adom_version:
+        print(f"  Source ADOM version : {cyan(_format_adom_version(src_adom_version))}")
+    print(f"  {dim('Recommended: import to the same FortiManager version and the same ADOM version.')}")
     print()
 
     # Pick target ADOM
     print(bold("  " + "─" * 48))
-    target_adom = _pick_target_adom(client, src_version, adom_enabled)
+    target_adom = _pick_target_adom(client, src_adom_version, adom_enabled)
     if target_adom is None:
         return
     _ensure_adom(client, target_adom)
@@ -3476,6 +3616,7 @@ def mode_template_export(client: FMGClient, adom_enabled: bool) -> None:
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "fmg_version": client.get_sys_status()[0],
             "source_adom": adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
         },
         "ipsec_templates":        [],
         "sdwan_overlay_templates": [],
@@ -3567,17 +3708,19 @@ def mode_template_import(client: FMGClient, adom_enabled: bool) -> None:
 
     ipsec_tmpls = payload.get("ipsec_templates", [])
     sdwan_tmpls = payload.get("sdwan_overlay_templates", [])
-    src_version = payload.get("metadata", {}).get("fmg_version", "")
-    src_adom    = payload.get("metadata", {}).get("source_adom", "")
+    meta = payload.get("metadata", {})
+    src_adom    = meta.get("source_adom", "")
+    src_adom_version = _source_adom_version_from_metadata(meta, src_adom)
     print(green(f"OK  ({len(ipsec_tmpls)} IPsec, {len(sdwan_tmpls)} SD-WAN Overlay)"))
-    print(f"  Source ADOM : {cyan(display_name(src_adom))}")
-    if src_version:
-        print(f"  Source FMG  : {cyan(src_version)}")
+    print(f"  Source ADOM         : {cyan(display_name(src_adom))}")
+    if src_adom_version:
+        print(f"  Source ADOM version : {cyan(_format_adom_version(src_adom_version))}")
+    print(f"  {dim('Recommended: import to the same FortiManager version and the same ADOM version.')}")
 
     # Pick target ADOM
     print()
     print(bold("  " + "─" * 48))
-    target_adom = _pick_target_adom(client, src_version, adom_enabled)
+    target_adom = _pick_target_adom(client, src_adom_version, adom_enabled)
     if target_adom is None:
         return
     _ensure_adom(client, target_adom)
@@ -3621,46 +3764,778 @@ def mode_template_import(client: FMGClient, adom_enabled: bool) -> None:
 
 
 
+
+# CLI script export/import and device migration helpers
+
+_SCRIPT_STRIP = {"oid", "obj-ver", "uuid", "_image-base64", "dev_oid", "pkg oid"}
+
+
+def _status_code(resp: dict) -> int:
+    """Return FortiManager JSON-RPC status code from a response."""
+    return resp.get("result", [{}])[0].get("status", {}).get("code", -1)
+
+
+def _status_message(resp: dict) -> str:
+    """Return FortiManager JSON-RPC status message from a response."""
+    return resp.get("result", [{}])[0].get("status", {}).get("message", "")
+
+
+def _script_clean(script: dict) -> dict:
+    """Strip FMG-generated fields before importing a script."""
+    return {k: v for k, v in script.items() if k not in _SCRIPT_STRIP}
+
+
+def _get_scripts(client: FMGClient, adom: str) -> list[dict]:
+    """Return CLI scripts from an ADOM."""
+    url = f"/dvmdb/adom/{adom}/script"
+    entries, code = client.get_table(url)
+    if code != 0:
+        print(red(f"  Failed to fetch scripts from {display_name(adom)} (code {code})."))
+        return []
+    return entries or []
+
+
+def _pick_named_items(items: list[dict], label: str, name_key: str = "name") -> list[dict] | None:
+    """Generic numbered picker for objects/devices/scripts."""
+    if not items:
+        print(dim("  Nothing found."))
+        return []
+
+    names = [str(i.get(name_key, i.get("id", ""))) for i in items]
+    col = max(len(n) for n in names) if names else 8
+    print()
+    print(bold(f"  {label}"))
+    print()
+    for idx, (item, name) in enumerate(zip(items, names), 1):
+        extra = ""
+        if item.get("type"):
+            extra = f"  {dim(str(item.get('type')))}"
+        elif item.get("serial"):
+            extra = f"  {dim(str(item.get('serial')))}"
+        elif item.get("sn"):
+            extra = f"  {dim(str(item.get('sn')))}"
+        print(f"    {cyan(str(idx).ljust(3))}  {name.ljust(col)}{extra}")
+    print()
+    print(f"  Press {dim('Enter')} for all, or enter numbers/names, e.g. {dim('1,3')}.")
+    print(f"  Type {dim('back')} to go back.")
+    print()
+
+    while True:
+        raw = input("  Selection > ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return None
+        if raw == "" or raw.lower() == "all":
+            return items
+
+        selected = []
+        invalid = []
+        seen = set()
+        by_name = {n: i for n, i in zip(names, items)}
+        for token in (t.strip() for t in raw.split(",") if t.strip()):
+            if token.isdigit():
+                idx = int(token) - 1
+                if 0 <= idx < len(items) and idx not in seen:
+                    seen.add(idx)
+                    selected.append(items[idx])
+                else:
+                    invalid.append(token)
+            elif token in by_name:
+                item = by_name[token]
+                ident = id(item)
+                if ident not in seen:
+                    seen.add(ident)
+                    selected.append(item)
+            else:
+                invalid.append(token)
+        if invalid:
+            print(red(f"  Unknown: {', '.join(invalid)} — try again."))
+            continue
+        if not selected:
+            print(red("  Nothing selected — try again."))
+            continue
+        return selected
+
+
+def mode_script_export(client: FMGClient, adom_enabled: bool) -> None:
+    """Export ADOM CLI scripts from /dvmdb/adom/{adom}/script."""
+    print()
+    print(bold("  " + "─" * 48))
+    adoms = select_adoms(client, None, adom_enabled)
+    if adoms is None:
+        return
+    if len(adoms) > 1:
+        print(yellow("  CLI script export works one ADOM at a time. Using first."))
+    adom = adoms[0]
+
+    print(f"  {dim('Fetching CLI scripts...')}", end=" ", flush=True)
+    scripts = _get_scripts(client, adom)
+    print(green(f"{len(scripts)} found") if scripts else dim("none"))
+    if not scripts:
+        return
+
+    selected = _pick_named_items(scripts, "Select CLI scripts to export")
+    if selected is None:
+        return
+
+    output = {
+        "metadata": {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "fmg_version": client.get_sys_status()[0],
+            "source_adom": adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
+            "count": len(selected),
+        },
+        "scripts": selected,
+    }
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname = f"fmg_scripts_{timestamp}_{safe_adom}.json"
+    enc_pw = _prompt_encryption_password(confirm=True)
+    _save_file(fname, output, enc_pw, "CLI scripts export")
+    print()
+
+
+def mode_script_import(client: FMGClient, adom_enabled: bool) -> None:
+    """Import CLI scripts into a target ADOM."""
+    candidates = sorted(
+        f for f in os.listdir(".")
+        if f.startswith("fmg_scripts") and (f.endswith(".json") or f.endswith(".fmgenc"))
+    )
+    if candidates:
+        print()
+        print("  Available CLI script export files:\n")
+        for i, f in enumerate(candidates, 1):
+            size_kb = os.path.getsize(f) / 1024
+            print(f"    {cyan(str(i))}  {f}  {dim(f'({size_kb:.0f} KB)')}")
+        print()
+        raw = input("  Select file (number or path): ").strip()
+        if raw.lower() in ("back", "b", "q"):
+            return
+        fname = candidates[int(raw) - 1] if raw.isdigit() and 1 <= int(raw) <= len(candidates) else raw
+    else:
+        fname = input("  Path to CLI script export JSON file: ").strip()
+        if not fname:
+            return
+
+    if not os.path.isfile(fname):
+        print(red(f"  File not found: {fname}"))
+        return
+
+    try:
+        payload = _load_file(fname)
+    except (ValueError, SystemExit, json.JSONDecodeError) as exc:
+        print(red(f"  Failed to load file: {exc}"))
+        return
+
+    scripts = payload.get("scripts", [])
+    if not isinstance(scripts, list) or not scripts:
+        print(red("  No scripts found in file."))
+        return
+
+    meta = payload.get("metadata", {})
+    src_adom = meta.get("source_adom", "")
+    src_adom_version = _source_adom_version_from_metadata(meta, src_adom)
+    print(green(f"OK  ({len(scripts)} script(s))"))
+    if src_adom:
+        print(f"  Source ADOM         : {cyan(display_name(src_adom))}")
+    if src_adom_version:
+        print(f"  Source ADOM version : {cyan(_format_adom_version(src_adom_version))}")
+    print(f"  {dim('Recommended: import to the same FortiManager version and the same ADOM version.')}")
+
+    print()
+    print(bold("  " + "─" * 48))
+    target_adom = _pick_target_adom(client, src_adom_version, adom_enabled)
+    if target_adom is None:
+        return
+    _ensure_adom(client, target_adom)
+
+    clean = [_script_clean(s) for s in scripts]
+    url = f"/dvmdb/adom/{target_adom}/script"
+
+    print(f"  Importing {bold(str(len(clean)))} CLI script(s) into {cyan(display_name(target_adom))} ...", end=" ", flush=True)
+    resp = client._call("set", [{"url": url, "data": clean}])
+    code = _status_code(resp)
+    failed = []
+    if code != 0:
+        # Fallback one by one to show exact failures.
+        for item in clean:
+            r = client._call("set", [{"url": url, "data": item}])
+            c = _status_code(r)
+            if c != 0:
+                failed.append({
+                    "name": item.get("name", "?"),
+                    "code": c,
+                    "message": _status_message(r),
+                })
+    print(green("OK") if not failed else red(f"{len(failed)} error(s)"))
+
+    if failed:
+        print()
+        print(bold(f"  {red('✗')} Failed scripts:"))
+        for f in failed:
+            print(f"    {red('✗')} {f['name']}  {dim('code %s: %s' % (f.get('code'), f.get('message')))}")
+    print()
+
+
+def _get_devices(client: FMGClient, adom: str) -> list[dict]:
+    """Return managed devices in an ADOM."""
+    entries, code = client.get_table(f"/dvmdb/adom/{adom}/device")
+    if code != 0:
+        print(red(f"  Failed to fetch devices from {display_name(adom)} (code {code})."))
+        return []
+    return entries or []
+
+
+def _device_name(dev: dict) -> str:
+    return str(dev.get("name") or dev.get("hostname") or dev.get("sn") or dev.get("serial") or "")
+
+
+def _pick_devices(client: FMGClient, adom: str) -> list[dict] | None:
+    print(f"  {dim('Fetching devices...')}", end=" ", flush=True)
+    devices = _get_devices(client, adom)
+    print(green(f"{len(devices)} found") if devices else dim("none"))
+    if not devices:
+        return []
+
+    # Normalize name field for picker.
+    for d in devices:
+        if not d.get("name"):
+            d["name"] = _device_name(d)
+    return _pick_named_items(devices, "Select device(s)", "name")
+
+
+def _move_devices_to_adom(client: FMGClient, adom_enabled: bool) -> None:
+    """Move selected devices/VDOM members into another ADOM."""
+    print()
+    print(bold("  Source ADOM"))
+    print(bold("  " + "─" * 48))
+    src_adoms = select_adoms(client, None, adom_enabled)
+    if src_adoms is None:
+        return
+    if len(src_adoms) > 1:
+        print(yellow("  Device move works one source ADOM at a time. Using first."))
+    src_adom = src_adoms[0]
+
+    devices = _pick_devices(client, src_adom)
+    if devices is None or not devices:
+        return
+
+    print()
+    print(bold("  Target ADOM"))
+    print(bold("  " + "─" * 48))
+    target_adom = _pick_target_adom(client, "", adom_enabled)
+    if target_adom is None:
+        return
+    _ensure_adom(client, target_adom)
+
+    vdom = prompt("VDOM/member to move", "root")
+    print()
+    print(yellow("  This will add selected device/VDOM member(s) to the target ADOM."))
+    print(dim("  If workspace mode is enabled, lock the source/target ADOMs first."))
+    confirm = input(f"  Continue moving {len(devices)} member(s) to {display_name(target_adom)}? [y/N]: ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print(dim("  Cancelled."))
+        return
+
+    failed = []
+    for dev in devices:
+        name = _device_name(dev)
+        print(f"  Moving {cyan(name)} / {cyan(vdom)} → {cyan(display_name(target_adom))} ...", end=" ", flush=True)
+        resp = client._call("add", [{
+            "url": f"/dvmdb/adom/{target_adom}/object member",
+            "data": {"name": name, "vdom": vdom},
+        }])
+        code = _status_code(resp)
+        if code == 0:
+            print(green("OK"))
+        else:
+            msg = _status_message(resp)
+            failed.append({"name": name, "code": code, "message": msg})
+            print(red(f"failed (code {code})"))
+
+    if failed:
+        print()
+        print(bold(f"  {red('✗')} Failed move(s):"))
+        for f in failed:
+            print(f"    {red('✗')} {f['name']}  {dim('code %s: %s' % (f.get('code'), f.get('message')))}")
+    print()
+
+
+def _monitor_task(client: FMGClient, taskid: int, interval: int = 3, timeout: int = 300) -> None:
+    """Best-effort FortiManager task monitor."""
+    print(f"  Monitoring task {cyan(str(taskid))} ...")
+    start = time.time()
+    last_line = ""
+    while time.time() - start < timeout:
+        resp = client._call("get", [{"url": f"/task/task/{taskid}"}])
+        code = _status_code(resp)
+        data = resp.get("result", [{}])[0].get("data", {})
+        if code != 0:
+            print(red(f"  Task query failed (code {code}): {_status_message(resp)}"))
+            return
+        if isinstance(data, list):
+            data = data[0] if data else {}
+
+        percent = data.get("percent", data.get("progress", ""))
+        state = str(data.get("state", data.get("status", "")))
+        num_err = data.get("num_err", data.get("num-error", ""))
+        line = data.get("line", data.get("history", ""))
+        parts = []
+        if percent != "":
+            parts.append(f"{percent}%")
+        if state:
+            parts.append(f"state={state}")
+        if num_err != "":
+            parts.append(f"errors={num_err}")
+        if line and isinstance(line, str):
+            parts.append(line[:80])
+        display = "  " + " | ".join(parts) if parts else f"  Task {taskid} running..."
+        if display != last_line:
+            print(display)
+            last_line = display
+
+        if str(percent) == "100" or state.lower() in ("done", "completed", "success", "error", "failed", "aborted", "cancelled"):
+            return
+        time.sleep(interval)
+    print(yellow(f"  Stopped monitoring after {timeout}s. Check System Settings > Task Monitor."))
+
+
+def _retrieve_device_config(client: FMGClient, adom_enabled: bool) -> None:
+    """Trigger retrieve config for selected devices."""
+    print()
+    print(bold("  ADOM"))
+    print(bold("  " + "─" * 48))
+    adoms = select_adoms(client, None, adom_enabled)
+    if adoms is None:
+        return
+    if len(adoms) > 1:
+        print(yellow("  Retrieve config works one ADOM at a time. Using first."))
+    adom = adoms[0]
+
+    devices = _pick_devices(client, adom)
+    if devices is None or not devices:
+        return
+
+    members = [{"name": _device_name(d)} for d in devices]
+    tag = prompt("Task tag", "Retrieve via API")
+    print()
+    print(f"  Retrieving config for {bold(str(len(members)))} device(s) in {cyan(display_name(adom))} ...", end=" ", flush=True)
+    resp = client._call("exec", [{
+        "url": "/dvm/cmd/reload/dev-list",
+        "data": {
+            "adom": adom,
+            "flags": ["create_task", "nonblocking"],
+            "reload-dev-member-list": members,
+            "tag": tag,
+            "from": "dvm",
+        },
+    }])
+    code = _status_code(resp)
+    if code != 0:
+        print(red(f"failed (code {code}): {_status_message(resp)}"))
+        return
+    data = resp.get("result", [{}])[0].get("data", {}) or {}
+    taskid = data.get("taskid")
+    print(green("OK"))
+    if taskid is not None:
+        print(f"  Task ID: {cyan(str(taskid))}")
+        raw = input(f"  Monitor task now? [{green('Y')}/n]: ").strip().lower()
+        if raw not in ("n", "no"):
+            try:
+                _monitor_task(client, int(taskid))
+            except Exception as exc:
+                print(yellow(f"  Task monitor could not continue: {exc}"))
+    print()
+
+
+def mode_device_ops(client: FMGClient, adom_enabled: bool) -> None:
+    """Device helper menu used during migration."""
+    while True:
+        print()
+        print(bold("  Device operations"))
+        print()
+        print(f"  {cyan('1')}  Move device/VDOM to another ADOM")
+        print(f"  {cyan('2')}  Retrieve device config")
+        print()
+        print(f"  Type {dim('back')} to return to the main menu.")
+        print()
+        raw = input("  Selection [1/2]: ").strip().lower()
+        if raw in ("back", "b", "q"):
+            return
+        if raw in ("1", "move", "m"):
+            _move_devices_to_adom(client, adom_enabled)
+        elif raw in ("2", "retrieve", "r"):
+            _retrieve_device_config(client, adom_enabled)
+        else:
+            print(red("  Please enter 1 or 2."))
+            continue
+
+        print("  " + "─" * 48)
+        again = input(f"  Device operations menu again? [{green('Y')}/n]: ").strip().lower()
+        if again in ("n", "no", "q"):
+            return
+
 def pick_direction() -> str:
-    """Top-level menu: Export or Import."""
+    """Top-level menu."""
     print()
-    print(bold("  What would you like to do?"))
+    print(bold("  Main menu — what would you like to do?"))
     print()
-    print(f"    {cyan('1')}  Export  {dim('(extract data from FMG to file)')}")
-    print(f"    {cyan('2')}  Import  {dim('(push data from file into FMG)')}")
+    print(f"    {cyan('1')}  Export             {dim('(extract data from FMG to file)')}")
+    print(f"    {cyan('2')}  Import             {dim('(push data from file into FMG)')}")
+    print(f"    {cyan('3')}  Device operations  {dim('(move devices / retrieve config)')}")
+    print()
+    print(f"  Note: {cyan('all')} is available inside Export/Import. Device operations stays here as option {cyan('3')}.")
     print()
     while True:
-        raw = input("  Select [1/2]: ").strip().lower()
+        raw = input("  Main menu select [1/2/3]: ").strip().lower()
         if raw in ("1", "export", "e"):
             return "export"
         if raw in ("2", "import", "i"):
             return "import"
-        print(red("  Please enter 1 or 2."))
+        if raw in ("3", "device", "devices", "d", "move", "retrieve"):
+            return "device"
+        print(red("  Please enter 1, 2, or 3."))
 
 
 def pick_data_type(direction: str) -> str:
     """Ask what type of data to export or import."""
     verb = "Export" if direction == "export" else "Import"
     print()
-    print(bold(f"  {verb} — what data?"))
+    print(bold(f"  {verb} data menu"))
+    print(dim("  This menu is only for configuration data. To move devices or retrieve config, type back and choose Main menu option 3."))
     print()
     print(f"    {cyan('1')}  ADOM objects       {dim('(firewall addresses, services, users, etc.)')}")
-    print(f"    {cyan('2')}  Policy packages    {dim('(firewall policies, DoS, NAT, etc.)')}")
+    print(f"    {cyan('2')}  Policy packages    {dim('(firewall policies, DoS, NAT, policy blocks)')}")
     print(f"    {cyan('3')}  Templates          {dim('(IPsec + SD-WAN Overlay templates)')}")
+    print(f"    {cyan('4')}  CLI scripts        {dim('(ADOM scripts from Device Manager)')}")
+    print(f"    {cyan('5')}  Full export/import {dim('(select ADOM once; complete migration bundle)')}")
     print()
-    print(f"  Type {dim('back')} to go back.")
+    print(f"  Type {dim('all')} to run the full migration bundle in dependency-safe order.")
+    print(f"  Type {dim('back')} to return to the main menu for Device operations.")
     print()
     while True:
-        raw = input("  Select [1/2/3]: ").strip().lower()
-        if raw in ("back", "b", "q"):
+        raw = input("  Data menu select [1/2/3/4/5/all/back]: ").strip().lower()
+        if raw in ("back", "b", "q", "main", "m", "0"):
             return "back"
-        if raw in ("1", "objects", "o"):
+        if raw in ("1", "objects", "object", "o"):
             return "objects"
         if raw in ("2", "policy", "p", "policies"):
             return "policy"
-        if raw in ("3", "templates", "t"):
+        if raw in ("3", "templates", "template", "t"):
             return "templates"
-        print(red("  Please enter 1, 2, or 3."))
+        if raw in ("4", "scripts", "script", "s", "cli"):
+            return "scripts"
+        if raw in ("5", "all", "a"):
+            return "all"
+        print(red("  Please enter 1, 2, 3, 4, 5, all, or back."))
+
+
+def _print_full_migration_order(direction: str) -> None:
+    """Show the dependency-safe order used by the All workflow."""
+    verb = "Export" if direction == "export" else "Import"
+    print()
+    print(bold(f"  {verb} all — dependency-safe order"))
+    print()
+    print(f"    {cyan('1')}  ADOM objects")
+    print(f"    {cyan('2')}  Policy packages")
+    print(f"    {cyan('3')}  Templates")
+    print(f"    {cyan('4')}  CLI scripts")
+    print()
+    if direction == "import":
+        print(yellow("  ADOM objects are imported first because policies reference objects."))
+    print()
+
+
+def _confirm_all_workflow(direction: str) -> bool:
+    """Confirm before running the multi-step all workflow."""
+    _print_full_migration_order(direction)
+    raw = input(f"  Continue with {direction} all? [{green('Y')}/n]: ").strip().lower()
+    return raw not in ("n", "no", "q", "quit", "back")
+
+
+def _run_objects_export_interactive(client: FMGClient, adom_enabled: bool, args: argparse.Namespace) -> None:
+    """Run the existing ADOM object export workflow."""
+    adoms = select_adoms(client, args.adom, adom_enabled)
+    if adoms is None:
+        return
+
+    if args.category:
+        tables = select_tables(args.category)
+        print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
+    else:
+        tables = select_tables_interactive(ALL_TABLES)
+        if tables is None:
+            return
+
+    while True:
+        completed = run_once(client, adoms, tables, args)
+        if not completed:
+            break
+        print("  " + "─" * 48)
+        choice = input(
+            f"  Extract again? [{green('Y')} same scope / "
+            f"{cyan('a')} change ADOM / "
+            f"{cyan('o')} change objects / "
+            f"{dim('n')} back to menu]: "
+        ).strip().lower()
+        if choice in ("n", "no", "q", "quit", "exit"):
+            break
+        elif choice in ("a", "adom"):
+            adoms = select_adoms(client, None, adom_enabled)
+            if adoms is None:
+                break
+        elif choice in ("o", "obj", "objects"):
+            tables = select_tables_interactive(ALL_TABLES)
+            if tables is None:
+                break
+
+
+def _export_objects_complete(client: FMGClient, adom: str, args: argparse.Namespace,
+                             enc_pw: str | None) -> None:
+    """Export every ADOM object table for one ADOM without extra prompts."""
+    fmg_version, _ = client.get_sys_status()
+    result = run_extraction(client, [adom], ALL_TABLES, fmg_version)
+    _add_source_adom_versions(client, result, [adom])
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_stem = f"fmg_adom_objects_{timestamp}"
+
+    print(f"\n  {bold('Saving ADOM objects...')}")
+    write_json_per_adom(result, out_stem, no_csv=args.no_csv, enc_password=enc_pw)
+
+    if not args.no_summary:
+        write_summary(result)
+
+
+def _policy_export_complete(client: FMGClient, adom: str,
+                            enc_pw: str | None) -> None:
+    """Export all policy packages, all policy types, and all policy blocks for one ADOM."""
+    print(f"  {dim('Fetching policy packages...')}", end=" ", flush=True)
+    pkgs = client.get_packages(adom)
+    packages = [p for p in pkgs if p.get("type") != "folder"]
+    print(green(f"{len(packages)} found") if packages else dim("none"))
+    if not packages:
+        return
+
+    tables = POLICY_TABLES
+
+    print(f"  {dim('Fetching policy blocks...')}", end=" ", flush=True)
+    pblocks = client.get_pblocks(adom)
+    print(green(f"{len(pblocks)} found") if pblocks else dim("none"))
+
+    print()
+    print(f"  Exporting {bold(str(len(packages)))} package(s) "
+          f"x {bold(str(len(tables)))} policy type(s) "
+          f"+ {bold(str(len(pblocks)))} policy block(s) "
+          f"from ADOM {cyan(display_name(adom))}")
+    print()
+
+    output = {
+        "metadata": {
+            "exported_at":  datetime.now(timezone.utc).isoformat(),
+            "fmg_version":  client.get_sys_status()[0],
+            "source_adom":  adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
+            "packages":     [p["path"] for p in packages],
+            "policy_types": [t["name"] for t in tables],
+            "pblocks":      [p["name"] for p in pblocks],
+        },
+        "packages": packages,
+        "data": {},
+        "pblocks": {},
+    }
+
+    bar_width = 30
+    t_start = time.time()
+    total_pol = 0
+    total_pkgs = len(packages)
+
+    for i, pkg in enumerate(packages, 1):
+        filled = int(bar_width * i / max(total_pkgs, 1))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        pct = 100 * i // max(total_pkgs, 1)
+        print(f"\r  [{bar}] {pct:>3}%  {cyan(pkg['path'][:40].ljust(40))}",
+              end="", flush=True)
+        pkg_data = _fetch_package(client, adom, pkg, tables)
+        output["data"][pkg["path"]] = pkg_data
+        total_pol += sum(len(v) if isinstance(v, list) else 1 for v in pkg_data.values())
+
+    if pblocks:
+        print(f"\n  Exporting policy blocks...")
+        for pb in pblocks:
+            pb_data = _fetch_pblock_policies(client, adom, pb["name"])
+            output["pblocks"][pb["name"]] = pb_data
+            pb_count = sum(len(v) for v in pb_data.values())
+            total_pol += pb_count
+            print(f"    {cyan(pb['name']):<30} {pb_count} policies")
+
+    elapsed = time.time() - t_start
+    print(f"\n  Fetched {green(str(total_pol))} policies total in {elapsed:.1f}s")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname = f"fmg_policy_{timestamp}_{safe_adom}.json"
+    _save_file(fname, output, enc_pw, "policy export")
+    print()
+
+
+def _template_export_complete(client: FMGClient, adom: str,
+                              enc_pw: str | None) -> None:
+    """Export all IPsec and SD-WAN Overlay templates for one ADOM without prompts."""
+    output = {
+        "metadata": {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "fmg_version": client.get_sys_status()[0],
+            "source_adom": adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
+        },
+        "ipsec_templates": [],
+        "sdwan_overlay_templates": [],
+    }
+
+    print(f"  {dim('Fetching IPsec templates...')}", end=" ", flush=True)
+    ipsec_list = _get_templates(client, adom, "_ipsec")
+    print(green(f"{len(ipsec_list)} found") if ipsec_list else dim("none"))
+
+    for t in ipsec_list:
+        print(f"  Fetching {cyan(t['name'])} ...", end=" ", flush=True)
+        tmpl = _fetch_template(client, adom, "_ipsec", t["name"], IPSEC_TEMPLATE_SUBS)
+        tmpl["meta"] = t
+        output["ipsec_templates"].append(tmpl)
+        total = sum(len(v) for v in tmpl["subs"].values())
+        masked = tmpl.get("masked_secrets", [])
+        suffix = f"  {yellow(f'{len(masked)} secret(s) masked')}" if masked else ""
+        print(green(f"{total} sub-objects") + suffix)
+
+    print(f"  {dim('Fetching SD-WAN Overlay templates...')}", end=" ", flush=True)
+    sdwan_list = _get_templates(client, adom, "_sdwan_overlay")
+    print(green(f"{len(sdwan_list)} found") if sdwan_list else dim("none"))
+
+    for t in sdwan_list:
+        print(f"  Fetching {cyan(t['name'])} ...", end=" ", flush=True)
+        tmpl = _fetch_template(client, adom, "_sdwan_overlay", t["name"], SDWAN_OVERLAY_SUBS)
+        tmpl["meta"] = t
+        output["sdwan_overlay_templates"].append(tmpl)
+        total = sum(len(v) for v in tmpl["subs"].values())
+        print(green(f"{total} sub-objects"))
+
+    if not output["ipsec_templates"] and not output["sdwan_overlay_templates"]:
+        print(dim("  No templates found; skipping template export file."))
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname = f"fmg_templates_{timestamp}_{safe_adom}.json"
+    _save_file(fname, output, enc_pw, "template export")
+    print()
+
+
+def _script_export_complete(client: FMGClient, adom: str,
+                            enc_pw: str | None) -> None:
+    """Export all ADOM CLI scripts for one ADOM without prompts."""
+    print(f"  {dim('Fetching CLI scripts...')}", end=" ", flush=True)
+    scripts = _get_scripts(client, adom)
+    print(green(f"{len(scripts)} found") if scripts else dim("none"))
+    if not scripts:
+        return
+
+    output = {
+        "metadata": {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "fmg_version": client.get_sys_status()[0],
+            "source_adom": adom,
+            "source_adom_version": _get_source_adom_version(client, adom),
+            "count": len(scripts),
+        },
+        "scripts": scripts,
+    }
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_adom = _sanitize_filename(display_name(adom))
+    fname = f"fmg_scripts_{timestamp}_{safe_adom}.json"
+    _save_file(fname, output, enc_pw, "CLI scripts export")
+    print()
+
+
+def _run_all_export(client: FMGClient, adom_enabled: bool, args: argparse.Namespace) -> None:
+    """
+    Run a full export in a true dependency-safe migration flow.
+
+    Unlike the normal per-feature export menu, this asks for ADOM selection once,
+    then exports complete data for each selected ADOM without re-prompting for
+    ADOM object scope, policy package scope, policy type scope, templates, or scripts.
+    """
+    if not _confirm_all_workflow("export"):
+        print(dim("  Cancelled."))
+        return
+
+    print()
+    print(bold("  Select source ADOM(s) for full export"))
+    print(bold("  " + "─" * 48))
+    adoms = select_adoms(client, args.adom, adom_enabled)
+    if adoms is None or not adoms:
+        return
+
+    print()
+    print(bold("  Export all options"))
+    print(dim("  ADOM objects will use all tables automatically."))
+    print(dim("  Policies will use all packages and all policy types automatically."))
+    print(dim("  Templates and CLI scripts will export all available entries."))
+    enc_pw = _prompt_encryption_password(confirm=True, force=args.encrypt)
+
+    total_adoms = len(adoms)
+    for a_idx, adom in enumerate(adoms, 1):
+        print()
+        print(bold(f"  Full export for ADOM {a_idx}/{total_adoms}: {display_name(adom)}"))
+        print(bold("  " + "═" * 56))
+
+        steps = [
+            ("ADOM objects", lambda adom=adom: _export_objects_complete(client, adom, args, enc_pw)),
+            ("Policy packages", lambda adom=adom: _policy_export_complete(client, adom, enc_pw)),
+            ("Templates", lambda adom=adom: _template_export_complete(client, adom, enc_pw)),
+            ("CLI scripts", lambda adom=adom: _script_export_complete(client, adom, enc_pw)),
+        ]
+
+        for idx, (label, fn) in enumerate(steps, 1):
+            print()
+            print(bold(f"  Step {idx}/4 — Export {label}"))
+            print("  " + "─" * 48)
+            try:
+                fn()
+            except Exception as exc:
+                print(red(f"  ✗ {label} export failed for {display_name(adom)}: {exc}"))
+                raw = input(f"  Continue with remaining export steps? [{green('Y')}/n]: ").strip().lower()
+                if raw in ("n", "no", "q", "quit", "exit"):
+                    return
+
+    print(green("  Full export workflow complete.\n"))
+
+
+def _run_all_import(client: FMGClient, adom_enabled: bool) -> None:
+    """Run all import workflows in migration dependency order."""
+    if not _confirm_all_workflow("import"):
+        print(dim("  Cancelled."))
+        return
+
+    steps = [
+        ("ADOM objects", lambda: mode_restore(client, adom_enabled)),
+        ("Policy packages", lambda: _policy_import(client, adom_enabled)),
+        ("Templates", lambda: mode_template_import(client, adom_enabled)),
+        ("CLI scripts", lambda: mode_script_import(client, adom_enabled)),
+    ]
+
+    for idx, (label, fn) in enumerate(steps, 1):
+        print()
+        print(bold(f"  Step {idx}/4 — Import {label}"))
+        print("  " + "─" * 48)
+        fn()
+
+        if idx < len(steps):
+            raw = input(f"  Continue to next import step? [{green('Y')}/n]: ").strip().lower()
+            if raw in ("n", "no", "q", "quit", "exit"):
+                print(dim("  Stopped before remaining import steps."))
+                break
 
 
 def main() -> None:
@@ -3716,6 +4591,16 @@ def main() -> None:
         while True:
             direction = pick_direction()
 
+            if direction == "device":
+                mode_device_ops(client, adom_enabled)
+                print("  " + "─" * 48)
+                again = input(
+                    f"  Return to main menu? [{green('Y')}/n]: "
+                ).strip().lower()
+                if again in ("n", "no", "q", "quit", "exit"):
+                    break
+                continue
+
             while True:
                 data_type = pick_data_type(direction)
                 if data_type == "back":
@@ -3725,52 +4610,26 @@ def main() -> None:
                 print(bold("  " + "─" * 48))
 
                 if direction == "export":
-                    if data_type == "objects":
-                        # Step 1: ADOM selection
-                        adoms = select_adoms(client, args.adom, adom_enabled)
-                        if adoms is None:
-                            continue
+                    if data_type == "all":
+                        _run_all_export(client, adom_enabled, args)
 
-                        # Step 2: Object scope
-                        if args.category:
-                            tables = select_tables(args.category)
-                            print(f"  Category filter: {cyan(args.category)} ({len(tables)} table(s))")
-                        else:
-                            tables = select_tables_interactive(ALL_TABLES)
-                            if tables is None:
-                                continue
-
-                        # Step 3: Extract loop
-                        while True:
-                            completed = run_once(client, adoms, tables, args)
-                            if not completed:
-                                break
-                            print("  " + "─" * 48)
-                            choice = input(
-                                f"  Extract again? [{green('Y')} same scope / "
-                                f"{cyan('a')} change ADOM / "
-                                f"{cyan('o')} change objects / "
-                                f"{dim('n')} back to menu]: "
-                            ).strip().lower()
-                            if choice in ("n", "no", "q", "quit", "exit"):
-                                break
-                            elif choice in ("a", "adom"):
-                                adoms = select_adoms(client, None, adom_enabled)
-                                if adoms is None:
-                                    break
-                            elif choice in ("o", "obj", "objects"):
-                                tables = select_tables_interactive(ALL_TABLES)
-                                if tables is None:
-                                    break
+                    elif data_type == "objects":
+                        _run_objects_export_interactive(client, adom_enabled, args)
 
                     elif data_type == "policy":
                         _policy_export(client, adom_enabled)
 
-                    else:  # templates
+                    elif data_type == "templates":
                         mode_template_export(client, adom_enabled)
 
+                    else:  # scripts
+                        mode_script_export(client, adom_enabled)
+
                 else:  # import
-                    if data_type == "objects":
+                    if data_type == "all":
+                        _run_all_import(client, adom_enabled)
+
+                    elif data_type == "objects":
                         while True:
                             mode_restore(client, adom_enabled)
                             print("  " + "─" * 48)
@@ -3783,8 +4642,11 @@ def main() -> None:
                     elif data_type == "policy":
                         _policy_import(client, adom_enabled)
 
-                    else:  # templates
+                    elif data_type == "templates":
                         mode_template_import(client, adom_enabled)
+
+                    else:  # scripts
+                        mode_script_import(client, adom_enabled)
 
                 print("  " + "─" * 48)
                 again = input(
