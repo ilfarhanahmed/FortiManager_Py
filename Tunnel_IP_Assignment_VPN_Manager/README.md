@@ -60,7 +60,7 @@ Example:
 
 Rollback
 --------
-Every --apply run creates rollback.json and rollback_cli.txt.
+Every --apply run creates rollback.json.
 To restore the previous values in the FMG Device Database:
 
     py fmg_vpn_tunnel_ip.py --rollback <output-directory>/rollback.json
