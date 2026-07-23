@@ -12,8 +12,8 @@ Workflow:
      (or a user-supplied regex).
   7. Correlate both endpoints using reciprocal Phase 1 remote-gw/local gateway.
   8. Allocate one /30 per confirmed pair:
-       endpoint A: local IP /32, remote-ip = endpoint B /30
-       endpoint B: local IP /32, remote-ip = endpoint A /30
+       endpoint A: local IP /32, remote-ip = endpoint B /32
+       endpoint B: local IP /32, remote-ip = endpoint A /32
   9. Show a dry-run plan.
  10. With --apply, update only the FortiManager Device Database.
 
@@ -23,15 +23,7 @@ Tested syntax target: FortiManager 7.6.x JSON API.
 Python: 3.10+
 Dependency: requests
 
-Release: final-v5
-All FortiManager system/interface GET operations explicitly send "verbose": 1.
-
-Version 5:
-  - Device-level /pm/config/device updates do not use ADOM workspace lock calls.
-  - rollback.json is the authoritative rollback mechanism.
-  - Rollback validates device, VDOM, interface type, and current values before restore.
-  - Rollback performs read-back verification after restore.
-  - No combined FortiGate CLI rollback file is generated."""
+"""
 
 from __future__ import annotations
 
@@ -56,7 +48,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("Missing dependency: requests. Install it with: py -m pip install requests") from exc
 
 
-TOOL_VERSION = "final-v6-table-read-revalidation"
+TOOL_VERSION = "final-v8-remote-ip-32"
 DEFAULT_CONFIG_FILES = ("config.ini", "fmg_vpn_tunnel_ip.ini")
 UNSET_CIDRS = {"", "0.0.0.0/0", "0.0.0.0 0.0.0.0", "0.0.0.0/255.255.255.255"}
 SUPPORTED_ADOM_OS_TYPES = {"fos", "foc", "ffw", "fwc", "fpx"}
@@ -486,17 +478,73 @@ def choose_item(title: str, rows: Sequence[dict[str, Any]], label_func, preselec
         print("Selection is out of range.")
 
 
+def adom_product_code(row: dict[str, Any]) -> str:
+    """Return the ADOM restricted product code in normalized text form.
+
+    FortiManager calls this field ``restricted_prds``.  With ``verbose=1`` it
+    is normally returned as text, for example ``fos`` or ``fpx``.  Numeric
+    fallback values are supported for FMG builds that still return the enum.
+    """
+    value = get_any(
+        row,
+        "restricted_prds",
+        "restricted-prds",
+        "restricted prds",
+        default="",
+    )
+
+    if isinstance(value, list):
+        value = value[0] if value else ""
+
+    if isinstance(value, dict):
+        value = get_any(value, "name", "value", "id", default="")
+
+    text_value = str(value).strip().lower()
+    if not text_value:
+        return ""
+
+    # Enum order from the FortiManager JSON API reference.  This is only a
+    # fallback; verbose output should normally provide the text value directly.
+    numeric_product_codes = {
+        0: "sim", 1: "fos", 2: "foc", 3: "fml", 4: "fch",
+        5: "fwb", 6: "log", 7: "fct", 8: "faz", 9: "fsa",
+        10: "fsw", 11: "fmg", 12: "fdd", 13: "fac", 14: "fpx",
+        15: "fna", 16: "ffw", 17: "fsr", 18: "fad", 19: "fdc",
+        20: "fap", 21: "fxt", 22: "fts", 23: "fai", 24: "fwc",
+        25: "fis", 26: "fed", 27: "fpa", 28: "fca", 29: "ftc",
+        30: "fss", 31: "fra", 32: "fabric",
+    }
+    if text_value.isdigit():
+        return numeric_product_codes.get(int(text_value), text_value)
+
+    return text_value
+
+
 def get_adoms(client: FmgClient) -> list[dict[str, Any]]:
-    rows = table_rows(client.get("/dvmdb/adom"))
+    # verbose=1 is required so restricted_prds is returned as a product code
+    # such as fos/foc/ffw/fwc/fpx rather than an enum number.
+    rows = table_rows(client.get("/dvmdb/adom", verbose=1))
     usable: list[dict[str, Any]] = []
+
     for row in rows:
-        name = str(row.get("name", ""))
+        name = str(row.get("name", "")).strip()
         if not name or name == "rootp":
             continue
-        os_type = str(get_any(row, "os_type", "os-type", default="")).lower()
-        if os_type and os_type not in SUPPORTED_ADOM_OS_TYPES and os_type != "unknown":
+
+        product = adom_product_code(row)
+        if product not in SUPPORTED_ADOM_OS_TYPES:
             continue
+
         usable.append(row)
+
+    if not usable:
+        raise ToolError(
+            "No FortiGate-compatible ADOMs were returned. Expected "
+            "restricted_prds to be one of: "
+            + ", ".join(sorted(SUPPORTED_ADOM_OS_TYPES))
+            + ". Run with --debug to inspect the /dvmdb/adom response."
+        )
+
     return sorted(usable, key=lambda x: str(x.get("name", "")).lower())
 
 
@@ -812,23 +860,35 @@ def validate_existing_pair(pair: TunnelPair) -> None:
         return
 
     assert a_local and b_local and a_remote and b_remote
+
+    # Both the local tunnel IP and peer remote-ip are host addresses (/32).
+    # The /30 is only the allocation block used to reserve two adjacent host
+    # addresses for the point-to-point tunnel pair.
+    a_block = ipaddress.ip_network(f"{a_local.ip}/30", strict=False)
+    b_block = ipaddress.ip_network(f"{b_local.ip}/30", strict=False)
+    usable_hosts = set(a_block.hosts())
+
     valid = (
         a_local.network.prefixlen == 32
         and b_local.network.prefixlen == 32
-        and a_remote.network.prefixlen == 30
-        and b_remote.network.prefixlen == 30
+        and a_remote.network.prefixlen == 32
+        and b_remote.network.prefixlen == 32
         and a_remote.ip == b_local.ip
         and b_remote.ip == a_local.ip
-        and a_local.ip in a_remote.network
-        and b_local.ip in a_remote.network
-        and a_remote.network == b_remote.network
+        and a_block == b_block
+        and a_local.ip in usable_hosts
+        and b_local.ip in usable_hosts
+        and a_local.ip != b_local.ip
     )
     if valid:
         pair.status = "configured"
-        pair.existing_subnet = str(a_remote.network)
+        pair.existing_subnet = str(a_block)
     else:
         pair.status = "conflict"
-        pair.reason = "Existing local IP and remote-ip values are not a reciprocal /32 + peer /30 pair."
+        pair.reason = (
+            "Existing local IP and remote-ip values are not reciprocal /32 host "
+            "addresses from the same /30 allocation block."
+        )
 
 
 def validate_pairs(pairs: list[TunnelPair]) -> None:
@@ -939,12 +999,12 @@ def allocate_pairs(pairs: list[TunnelPair], subnets: list[ipaddress.IPv4Network]
                 a_vdom=a.key.vdom,
                 a_tunnel=a.key.phase1,
                 a_local_ip=f"{a_ip}/32",
-                a_remote_ip=f"{b_ip}/30",
+                a_remote_ip=f"{b_ip}/32",
                 b_device=b.key.device,
                 b_vdom=b.key.vdom,
                 b_tunnel=b.key.phase1,
                 b_local_ip=f"{b_ip}/32",
-                b_remote_ip=f"{a_ip}/30",
+                b_remote_ip=f"{a_ip}/32",
                 a_old_ip=a.local_ip_raw,
                 a_old_remote_ip=a.remote_ip_raw,
                 b_old_ip=b.local_ip_raw,
@@ -1159,7 +1219,7 @@ The supported rollback method is the FortiManager JSON API rollback.
 
 Run:
 
-    py fmg_vpn_tunnel_ip_final_v5.py --rollback \"{path}\"
+    py fmg_vpn_tunnel_ip_final_v8.py --rollback \"{path}\"
 
 The rollback operation:
 
@@ -1603,7 +1663,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     adom_row = choose_item(
         "ADOMs",
         adoms,
-        lambda row: f"{row.get('name', '?')}  FortiOS={get_any(row, 'os_ver', 'os-ver', default='?')}",
+        lambda row: (
+            f"{row.get('name', '?')}  "
+            f"Product={adom_product_code(row)}  "
+            f"FortiOS={get_any(row, 'os_ver', 'os-ver', default='?')}"
+        ),
         args.adom,
     )
     adom = str(adom_row["name"])
