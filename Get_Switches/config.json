@@ -1,0 +1,6 @@
+{
+    "fmg_url": "https://<FMG_IP/FQDN>/jsonrpc",
+    "api_key": "<API_KEY>",
+    "adom": "<ADOM>",
+    "verify_ssl": false
+}
